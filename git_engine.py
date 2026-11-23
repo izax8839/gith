@@ -41,9 +41,78 @@ def find_git_executable():
     return None
 
 
+def is_winget_available():
+    """Windows 패키지 관리자(winget) 사용 가능 여부 확인"""
+    return bool(shutil.which("winget"))
+
+
+def install_git_via_winget(logger=None):
+    """
+    winget을 통해 공식 Git for Windows를 무인/자동 설치합니다.
+    """
+    def log(msg):
+        if logger:
+            logger(msg)
+
+    if not is_winget_available():
+        return False, "이 컴퓨터에서는 winget(Windows 패키지 관리자)을 사용할 수 없습니다."
+
+    log("⚡ 공식 Git for Windows 자동 설치를 시작합니다...")
+    log("   (화면에 관리자 권한 확인 창이 나타나면 [예]를 눌러주세요)")
+
+    cmd = [
+        "winget", "install",
+        "--id", "Git.Git",
+        "-e",
+        "--source", "winget",
+        "--accept-source-agreements",
+        "--accept-package-agreements"
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW,
+            text=True,
+            encoding="utf-8",
+            errors="replace"
+        )
+
+        for line in iter(proc.stdout.readline, ""):
+            line_str = line.strip()
+            if line_str and not line_str.startswith("-") and not line_str.startswith("\\"):
+                # 진행률 또는 주요 메시지만 선별 로그
+                if any(k in line_str for k in ["다운로드", "설치", "Download", "Install", "성공", "Successfully", "기다려"]):
+                    log(f"   {line_str}")
+
+        proc.stdout.close()
+        proc.wait()
+
+        # 설치 후 새로 생긴 git.exe 경로 탐색
+        new_git = find_git_executable()
+        if new_git:
+            log(f"🎉 Git 설치 완료! 감지된 경로: {new_git}")
+            return True, new_git
+        else:
+            if proc.returncode == 0:
+                log("Git 설치 명령이 종료되었습니다. 시스템 경로를 갱신합니다.")
+                return True, find_git_executable()
+            return False, f"설치 중 문제가 발생했습니다 (종료 코드: {proc.returncode})"
+
+    except Exception as e:
+        return False, f"Git 자동 설치 중 오류: {str(e)}"
+
+
 class GitEngine:
     def __init__(self, git_path=None):
         self.git_path = git_path or find_git_executable()
+
+    def refresh_git_path(self):
+        """새로 설치된 Git 경로를 재탐색하여 갱신합니다."""
+        self.git_path = find_git_executable()
+        return self.is_git_available()
 
     def is_git_available(self):
         return bool(self.git_path and os.path.isfile(self.git_path))

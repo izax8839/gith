@@ -11,7 +11,7 @@ import customtkinter as ctk
 
 from config_manager import load_config, save_config
 from github_api import GitHubAPI
-from git_engine import GitEngine, find_git_executable
+from git_engine import GitEngine, find_git_executable, install_git_via_winget, is_winget_available
 
 # 기본 테마 설정
 ctk.set_appearance_mode("System")  # System, Dark, Light
@@ -211,13 +211,13 @@ class GitSyncApp(ctk.CTk):
         self._check_git_status()
 
     def _build_ui(self):
-        # 메인 스크롤 프레임 또는 단일 프레임
+        # 메인 그리드 레이아웃
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
-        # 1. 헤더 영역
+        # 1. 헤더 영역 (Row 0)
         header_frame = ctk.CTkFrame(self, corner_radius=10)
-        header_frame.grid(row=0, column=0, padx=15, pady=(15, 8), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=15, pady=(15, 6), sticky="ew")
         header_frame.grid_columnconfigure(1, weight=1)
 
         logo_lbl = ctk.CTkLabel(
@@ -235,18 +235,85 @@ class GitSyncApp(ctk.CTk):
         )
         sub_lbl.grid(row=1, column=0, padx=15, pady=(0, 10), sticky="w")
 
+        # 헤더 우측 컨트롤 (Git 상태 버튼 + 테마 스위치)
+        header_right = ctk.CTkFrame(header_frame, fg_color="transparent")
+        header_right.grid(row=0, column=2, rowspan=2, padx=15, pady=10, sticky="e")
+
+        self.git_status_btn = ctk.CTkButton(
+            header_right,
+            text="Git 상태 확인 중...",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=32,
+            width=140,
+            command=self._on_git_status_btn_click
+        )
+        self.git_status_btn.pack(side="left", padx=(0, 10))
+
         # 테마 스위치
         self.theme_btn = ctk.CTkSegmentedButton(
-            header_frame,
+            header_right,
             values=["시스템", "다크", "라이트"],
             command=self._change_theme
         )
         self.theme_btn.set("시스템")
-        self.theme_btn.grid(row=0, column=2, rowspan=2, padx=15, pady=10, sticky="e")
+        self.theme_btn.pack(side="left")
 
-        # 2. 계정 설정 영역 (Card 1)
+        # Git 미설치 알림 배너 (Row 1 - 미설치 시에만 표시)
+        self.git_banner_frame = ctk.CTkFrame(
+            self,
+            corner_radius=10,
+            fg_color=("#fff8e1", "#2d2013"),
+            border_color="#f59e0b",
+            border_width=1
+        )
+        self.git_banner_frame.grid_columnconfigure(0, weight=1)
+
+        banner_top = ctk.CTkFrame(self.git_banner_frame, fg_color="transparent")
+        banner_top.grid(row=0, column=0, padx=15, pady=(10, 2), sticky="ew")
+
+        ctk.CTkLabel(
+            banner_top,
+            text="⚠️ 컴퓨터에 Git이 설치되어 있지 않습니다!",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=("#b45309", "#fbbf24")
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            self.git_banner_frame,
+            text="GitHub과 폴더를 동기화하려면 Git 엔진이 필요합니다.\n아래 [원클릭 자동 설치]를 누르시면 별도 설정 없이 바로 자동 설치됩니다.",
+            font=ctk.CTkFont(size=12),
+            justify="left",
+            text_color=("#78350f", "#fef3c7")
+        ).grid(row=1, column=0, padx=15, pady=(0, 10), sticky="w")
+
+        banner_btn_row = ctk.CTkFrame(self.git_banner_frame, fg_color="transparent")
+        banner_btn_row.grid(row=0, column=1, rowspan=2, padx=15, pady=10, sticky="e")
+
+        self.install_git_btn = ctk.CTkButton(
+            banner_btn_row,
+            text="⚡ Git 원클릭 자동 설치",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#059669",
+            hover_color="#047857",
+            height=36,
+            command=self._install_git_clicked
+        )
+        self.install_git_btn.pack(side="left", padx=(0, 6))
+
+        web_git_btn = ctk.CTkButton(
+            banner_btn_row,
+            text="🌐 웹에서 받기",
+            width=90,
+            height=36,
+            fg_color="gray",
+            hover_color="darkgray",
+            command=lambda: webbrowser.open("https://git-scm.com/download/win")
+        )
+        web_git_btn.pack(side="left")
+
+        # 2. 계정 설정 영역 (Card 1 - Row 2)
         acc_frame = ctk.CTkFrame(self, corner_radius=10)
-        acc_frame.grid(row=1, column=0, padx=15, pady=6, sticky="ew")
+        acc_frame.grid(row=2, column=0, padx=15, pady=6, sticky="ew")
         acc_frame.grid_columnconfigure(1, weight=1)
 
         acc_title = ctk.CTkLabel(
@@ -324,9 +391,9 @@ class GitSyncApp(ctk.CTk):
         )
         self.remember_chk.grid(row=0, column=1, sticky="e")
 
-        # 3. 동기화 대상 설정 (Card 2)
+        # 3. 동기화 대상 설정 (Card 2 - Row 3)
         target_frame = ctk.CTkFrame(self, corner_radius=10)
-        target_frame.grid(row=2, column=0, padx=15, pady=6, sticky="ew")
+        target_frame.grid(row=3, column=0, padx=15, pady=6, sticky="ew")
         target_frame.grid_columnconfigure(1, weight=1)
 
         target_title = ctk.CTkLabel(
@@ -392,13 +459,13 @@ class GitSyncApp(ctk.CTk):
         self.branch_entry.insert(0, "main")
         self.branch_entry.pack(side="left", padx=(5, 20))
 
-        # 4. 동기화 실행 및 자동화 영역 (Card 3)
+        # 4. 동기화 실행 및 자동화 영역 (Card 3 - Row 4)
         action_frame = ctk.CTkFrame(self, corner_radius=10)
-        action_frame.grid(row=3, column=0, padx=15, pady=6, sticky="nsew")
+        action_frame.grid(row=4, column=0, padx=15, pady=6, sticky="nsew")
         action_frame.grid_columnconfigure(0, weight=1)
         action_frame.grid_columnconfigure(1, weight=1)
         action_frame.grid_columnconfigure(2, weight=1)
-        action_frame.grid_rowconfigure(3, weight=1)
+        action_frame.grid_rowconfigure(4, weight=1)
 
         action_title = ctk.CTkLabel(
             action_frame,
@@ -407,7 +474,31 @@ class GitSyncApp(ctk.CTk):
         )
         action_title.grid(row=0, column=0, columnspan=3, padx=15, pady=(10, 5), sticky="w")
 
-        # 3대 동기화 버튼
+        # 동기화 메모 / 제목 입력창 (Row 1)
+        memo_frame = ctk.CTkFrame(action_frame, fg_color="transparent")
+        memo_frame.grid(row=1, column=0, columnspan=3, padx=15, pady=(2, 6), sticky="ew")
+        memo_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            memo_frame,
+            text="📝 동기화 메모/제목:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+
+        self.commit_msg_entry = ctk.CTkEntry(
+            memo_frame,
+            placeholder_text="예: 메인 시안 수정, 문서 1차 정리 등 (선택 사항, 비워두면 기본값 적용)"
+        )
+        self.commit_msg_entry.grid(row=0, column=1, sticky="ew")
+
+        ctk.CTkLabel(
+            memo_frame,
+            text="*시각은 메모 앞에 자동 기록됨",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).grid(row=0, column=2, padx=(8, 0), sticky="e")
+
+        # 3대 동기화 버튼 (Row 2)
         self.sync_btn = ctk.CTkButton(
             action_frame,
             text="🚀 원클릭 전체 동기화\n(내려받기 + 올리기 일괄 처리)",
@@ -417,7 +508,7 @@ class GitSyncApp(ctk.CTk):
             hover_color="#0860ca",
             command=lambda: self._start_git_task("sync")
         )
-        self.sync_btn.grid(row=1, column=0, padx=(15, 6), pady=6, sticky="ew")
+        self.sync_btn.grid(row=2, column=0, padx=(15, 6), pady=6, sticky="ew")
 
         self.pull_btn = ctk.CTkButton(
             action_frame,
@@ -428,7 +519,7 @@ class GitSyncApp(ctk.CTk):
             hover_color="#424a53",
             command=lambda: self._start_git_task("pull")
         )
-        self.pull_btn.grid(row=1, column=1, padx=6, pady=6, sticky="ew")
+        self.pull_btn.grid(row=2, column=1, padx=6, pady=6, sticky="ew")
 
         self.push_btn = ctk.CTkButton(
             action_frame,
@@ -439,11 +530,11 @@ class GitSyncApp(ctk.CTk):
             hover_color="#424a53",
             command=lambda: self._start_git_task("push")
         )
-        self.push_btn.grid(row=1, column=2, padx=(6, 15), pady=6, sticky="ew")
+        self.push_btn.grid(row=2, column=2, padx=(6, 15), pady=6, sticky="ew")
 
-        # 자동 동기화 설정
+        # 자동 동기화 설정 (Row 3)
         auto_frame = ctk.CTkFrame(action_frame, fg_color="transparent")
-        auto_frame.grid(row=2, column=0, columnspan=3, padx=15, pady=4, sticky="ew")
+        auto_frame.grid(row=3, column=0, columnspan=3, padx=15, pady=4, sticky="ew")
 
         self.auto_sync_var = ctk.BooleanVar(value=False)
         self.auto_sync_chk = ctk.CTkCheckBox(
@@ -470,7 +561,7 @@ class GitSyncApp(ctk.CTk):
 
         # 4. 실시간 로그 영역
         log_header_frame = ctk.CTkFrame(action_frame, fg_color="transparent")
-        log_header_frame.grid(row=3, column=0, columnspan=3, padx=15, pady=(8, 2), sticky="ew")
+        log_header_frame.grid(row=4, column=0, columnspan=3, padx=15, pady=(8, 2), sticky="ew")
         
         ctk.CTkLabel(
             log_header_frame,
@@ -492,12 +583,12 @@ class GitSyncApp(ctk.CTk):
 
         # 프로그레스 바
         self.progress_bar = ctk.CTkProgressBar(action_frame)
-        self.progress_bar.grid(row=4, column=0, columnspan=3, padx=15, pady=(2, 4), sticky="ew")
+        self.progress_bar.grid(row=5, column=0, columnspan=3, padx=15, pady=(2, 4), sticky="ew")
         self.progress_bar.set(0)
 
         # 로그 텍스트 박스
         self.log_textbox = ctk.CTkTextbox(action_frame, height=140, font=ctk.CTkFont(family="Consolas", size=12))
-        self.log_textbox.grid(row=5, column=0, columnspan=3, padx=15, pady=(0, 15), sticky="nsew")
+        self.log_textbox.grid(row=6, column=0, columnspan=3, padx=15, pady=(0, 15), sticky="nsew")
 
     def _change_theme(self, value):
         mode_map = {"시스템": "System", "다크": "Dark", "라이트": "Light"}
@@ -566,10 +657,87 @@ class GitSyncApp(ctk.CTk):
 
     def _check_git_status(self):
         if not self.git_engine.is_git_available():
-            self._log("⚠️ 경고: 시스템에서 Git을 찾을 수 없습니다.")
-            self._log("   Git for Windows 또는 GitHub Desktop을 설치해주시면 자동으로 인식합니다.")
+            self.git_banner_frame.grid(row=1, column=0, padx=15, pady=6, sticky="ew")
+            if hasattr(self, "git_status_btn"):
+                self.git_status_btn.configure(
+                    text="⚠️ Git 미설치",
+                    fg_color="#d97706",
+                    hover_color="#b45309"
+                )
+            self._log("⚠️ 경고: 시스템에 Git이 설치되어 있지 않습니다.")
+            self._log("   상단의 [⚡ Git 원클릭 자동 설치] 버튼을 누르시면 바로 설치됩니다.")
+            self._set_git_ready(False)
         else:
+            self.git_banner_frame.grid_remove()
+            if hasattr(self, "git_status_btn"):
+                self.git_status_btn.configure(
+                    text="✅ Git 설치 완료",
+                    fg_color="#1f883d",
+                    hover_color="#1a7f37"
+                )
             self._log(f"✅ Git 엔진 준비 완료: {self.git_engine.git_path}")
+            self._set_git_ready(True)
+
+    def _on_git_status_btn_click(self):
+        if self.git_engine.is_git_available():
+            messagebox.showinfo(
+                "Git 설치 확인",
+                f"✅ Git이 정상적으로 설치되어 동기화 준비가 완료되었습니다!\n\n"
+                f"• 감지된 경로:\n  {self.git_engine.git_path}\n\n"
+                f"• 상태: 정상 작동 중"
+            )
+        else:
+            self._install_git_clicked()
+
+    def _set_git_ready(self, is_ready):
+        state = "normal" if is_ready else "disabled"
+        if hasattr(self, "sync_btn"):
+            self.sync_btn.configure(state=state)
+            self.pull_btn.configure(state=state)
+            self.push_btn.configure(state=state)
+
+    def _install_git_clicked(self):
+        if not is_winget_available():
+            messagebox.showinfo(
+                "안내",
+                "이 컴퓨터에는 winget 패키지 관리자가 설치되어 있지 않습니다.\n공식 Git 다운로드 웹페이지로 이동합니다."
+            )
+            webbrowser.open("https://git-scm.com/download/win")
+            return
+
+        self.install_git_btn.configure(state="disabled", text="Git 설치 진행 중...")
+        self.progress_bar.start()
+        self._log("⚡ [Git 자동 설치] 설치 프로세스를 시작합니다. 1~2분 정도 소요될 수 있습니다...")
+
+        def _worker():
+            def safe_log(msg):
+                self.after(0, lambda: self._log(msg))
+
+            ok, res = install_git_via_winget(logger=safe_log)
+            self.after(0, lambda: self._on_git_install_finished(ok, res))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_git_install_finished(self, ok, res):
+        self.progress_bar.stop()
+        self.progress_bar.set(0)
+        self.install_git_btn.configure(state="normal", text="⚡ Git 원클릭 자동 설치")
+
+        if ok:
+            self.git_engine.refresh_git_path()
+            self._check_git_status()
+            messagebox.showinfo(
+                "설치 완료",
+                "🎉 Git 설치가 성공적으로 완료되었습니다!\n이제 동기화 기능을 자유롭게 사용하실 수 있습니다."
+            )
+        else:
+            self._log(f"❌ Git 설치 실패: {res}")
+            res_box = messagebox.askyesno(
+                "설치 안내",
+                f"자동 설치 중 문제가 발생했습니다:\n{res}\n\n공식 Git 웹사이트에서 직접 다운로드하시겠습니까?"
+            )
+            if res_box:
+                webbrowser.open("https://git-scm.com/download/win")
 
     def _load_saved_settings(self):
         c = self.config_data
@@ -739,6 +907,14 @@ class GitSyncApp(ctk.CTk):
         # 인증 URL 생성
         auth_url = GitEngine.build_authenticated_url(raw_repo_url, username, token)
 
+        # 커밋 메시지 생성: [시간] + 사용자 입력 메모/제목
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        user_title = self.commit_msg_entry.get().strip() if hasattr(self, "commit_msg_entry") else ""
+        if user_title:
+            commit_msg = f"[{now_str}] {user_title}"
+        else:
+            commit_msg = f"[{now_str}] 컴퓨터 파일 동기화"
+
         self._save_current_settings()
         self._set_ui_syncing_state(True)
 
@@ -752,6 +928,7 @@ class GitSyncApp(ctk.CTk):
                         folder_path=local_folder,
                         auth_url=auth_url,
                         branch=branch,
+                        commit_msg=commit_msg,
                         username=username,
                         logger=safe_log
                     )
@@ -760,7 +937,7 @@ class GitSyncApp(ctk.CTk):
                     ok, msg = self.git_engine.pull(local_folder, branch, logger=safe_log)
                 elif task_type == "push":
                     self.git_engine.init_and_set_remote(local_folder, auth_url, branch, username)
-                    ok, msg = self.git_engine.push(local_folder, branch, logger=safe_log)
+                    ok, msg = self.git_engine.push(local_folder, branch, commit_msg=commit_msg, logger=safe_log)
 
                 self.after(0, lambda: self._on_git_task_finished(task_type, ok, msg))
             except Exception as e:
@@ -774,6 +951,9 @@ class GitSyncApp(ctk.CTk):
         tname = task_names.get(task_type, "작업")
 
         if ok:
+            # 성공 시 입력창 초기화
+            if hasattr(self, "commit_msg_entry"):
+                self.commit_msg_entry.delete(0, "end")
             self._log(f"🎉 {tname} 작업이 성공적으로 완료되었습니다!")
         else:
             self._log(f"❌ {tname} 실패: {msg}")
