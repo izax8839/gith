@@ -185,7 +185,15 @@ class GitSyncApp(ctk.CTk):
         self.minsize(780, 750)
 
         # 창 아이콘 설정
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        if getattr(sys, "frozen", False):
+            base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        icon_path = os.path.join(base_dir, "app_icon.ico")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(os.path.dirname(sys.executable), "app_icon.ico")
+
         if os.path.exists(icon_path):
             try:
                 self.iconbitmap(icon_path)

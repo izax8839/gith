@@ -54,9 +54,11 @@ GitHub Desktop이 영어로 되어 있고 복잡하셨던 분들을 위해 만�
 
 ## 📁 파일 구조
 
-- `app.py`: 메인 GUI 프로그램 (CustomTkinter 기반)
+- `깃싱크.exe`: **독립 실행형 Windows 단일 실행 파일 (더블 클릭만으로 바로 실행)**
+- `app.py`: 메인 GUI 프로그램 소스 코드 (CustomTkinter 기반)
 - `git_engine.py`: Git 실행 및 푸시/풀/동기화 처리 엔진 (자동 Git 경로 탐색)
 - `github_api.py`: GitHub REST API 연동 (사용자 확인, 저장소 목록, 새 저장소 생성)
 - `config_manager.py`: 사용자 설정 저장 및 로드 (`config.json`)
-- `GitSync.bat`: 검은 콘솔 창 없이 앱을 실행하는 런처
+- `app_icon.ico`: 전용 고해상도 앱 아이콘
+- `GitSync.bat`: 검은 콘솔 창 없이 앱을 실행하는 레거시 런처
 - `GitSync_디버그.bat`: 오류 발생 시 디버그 로그를 볼 수 있는 콘솔 실행기
