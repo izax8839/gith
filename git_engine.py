@@ -362,3 +362,65 @@ class GitEngine:
 
         log("=== 모든 동기화가 성공적으로 완료되었습니다! ===")
         return True, "동기화 완료"
+
+    def inspect_sync_status(self, folder_path, auth_url, branch="main"):
+        """
+        로컬 폴더와 GitHub 원격 저장소의 최신 상태를 비교하여
+        어느 쪽이 더 최신인지, 내려받기 또는 업로드가 필요한지 진단합니다.
+        반환: (status_code, title_text, detail_text, has_remote_new)
+        """
+        if not folder_path or not os.path.isdir(folder_path):
+            return "NO_FOLDER", "폴더 미선택", "동기화할 컴퓨터 폴더를 선택해주세요.", False
+
+        if not self.is_git_available():
+            return "NO_GIT", "Git 미설치", "Git 엔진이 필요합니다.", False
+
+        if not self.is_git_repo(folder_path):
+            # 아직 .git이 없는 일반 폴더인 경우
+            return "NOT_INITIALIZED", "신규 연동 대기", "동기화 버튼을 누르면 이 폴더와 GitHub이 처음으로 연결됩니다.", False
+
+        # 1. 로컬에 커밋되지 않은 새/수정 파일이 있는지 확인
+        ok, status_out = self._run_git(folder_path, ["status", "--porcelain"])
+        has_local_changes = bool(ok and status_out.strip())
+
+        # 2. 로컬 최신 커밋 해시 확인
+        ok_l, local_head = self._run_git(folder_path, ["rev-parse", "HEAD"])
+        local_head = local_head.strip() if ok_l else None
+
+        # 3. 원격 최신 커밋 해시 가볍게 확인 (ls-remote)
+        ok_r, remote_out = self._run_git(folder_path, ["ls-remote", "--heads", auth_url, branch], timeout=15)
+        remote_head = None
+        if ok_r and remote_out.strip():
+            # 출력 형식: "<hash>\trefs/heads/<branch>"
+            for line in remote_out.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and branch in parts[1]:
+                    remote_head = parts[0]
+                    break
+
+        # 4. 상태 판정
+        if not remote_head and not local_head:
+            return "EMPTY", "저장소 비어있음", "GitHub과 로컬 폴더 모두 비어 있는 상태입니다.", False
+
+        if remote_head and not local_head:
+            return "BEHIND", "GitHub에 최신 파일 있음", "GitHub에 파일이 있습니다. 작업 전 먼저 [내려받기]를 해주세요!", True
+
+        if not remote_head and local_head:
+            return "AHEAD", "첫 업로드 대기 중", "내 컴퓨터의 파일들을 GitHub에 처음 올릴 준비가 되었습니다.", False
+
+        if remote_head == local_head:
+            if has_local_changes:
+                return "LOCAL_MODIFIED", "컴퓨터에 수정된 파일 있음", "내 컴퓨터에서 작업한 새 변경사항이 있습니다. [올리기]를 진행하세요.", False
+            else:
+                return "UP_TO_DATE", "완벽 동기화 완료", "내 컴퓨터와 GitHub의 파일이 완벽하게 일치합니다.", False
+
+        # 해시가 다를 때: 로컬 저장소에 remote_head가 이미 존재하는지 검사
+        ok_cat, _ = self._run_git(folder_path, ["cat-file", "-e", remote_head])
+        if ok_cat:
+            # 원격 커밋이 이미 로컬 역사에 포함되어 있음 -> 내 컴퓨터가 원격보다 앞섬
+            return "AHEAD", "컴퓨터에 새 커밋 있음", "내 컴퓨터의 최신 작업을 GitHub에 올릴 준비가 되었습니다.", False
+        else:
+            # 원격 커밋이 로컬에 없음 -> GitHub에 새 내용이 먼저 올라간 상태!
+            if has_local_changes:
+                return "DIVERGED", "양쪽 모두 수정됨 (주의)", "GitHub과 컴퓨터 양쪽에 모두 새 파일이 있습니다. [원클릭 전체 동기화]로 병합하세요.", True
+            return "BEHIND", "GitHub에 새로운 최신 파일 있음", "GitHub에 새 작업이 있습니다! 컴퓨터로 먼저 내려받으세요.", True
