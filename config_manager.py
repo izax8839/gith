@@ -15,12 +15,19 @@ DEFAULT_CONFIG = {
     "username": "",
     "token": "",
     "remember_token": True,
-    "local_folder": "",
-    "selected_repo": "",
-    "branch": "main",
+    "minimize_to_tray": True,
+    "autostart": False,
     "auto_sync_enabled": False,
     "auto_sync_interval": 10,  # 분 단위
-    "commit_message_prefix": "컴퓨터 파일 동기화"
+    "commit_message_prefix": "컴퓨터 파일 동기화",
+    "active_profile": "기본 작업",
+    "profiles": {
+        "기본 작업": {
+            "local_folder": "",
+            "selected_repo": "",
+            "branch": "main"
+        }
+    }
 }
 
 def load_config():
@@ -31,6 +38,23 @@ def load_config():
             data = json.load(f)
             config = DEFAULT_CONFIG.copy()
             config.update(data)
+
+            # 이전 버전 단일 설정 마이그레이션 호환 처리
+            if "profiles" not in data or not data["profiles"]:
+                config["profiles"] = {
+                    "기본 작업": {
+                        "local_folder": data.get("local_folder", ""),
+                        "selected_repo": data.get("selected_repo", ""),
+                        "branch": data.get("branch", "main")
+                    }
+                }
+                config["active_profile"] = "기본 작업"
+
+            # active_profile이 profiles 목록에 없는 경우 방어
+            if config["active_profile"] not in config["profiles"]:
+                first_k = list(config["profiles"].keys())[0] if config["profiles"] else "기본 작업"
+                config["active_profile"] = first_k
+
             return config
     except Exception:
         return DEFAULT_CONFIG.copy()

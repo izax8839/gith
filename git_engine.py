@@ -424,3 +424,130 @@ class GitEngine:
             if has_local_changes:
                 return "DIVERGED", "양쪽 모두 수정됨 (주의)", "GitHub과 컴퓨터 양쪽에 모두 새 파일이 있습니다. [원클릭 전체 동기화]로 병합하세요.", True
             return "BEHIND", "GitHub에 새로운 최신 파일 있음", "GitHub에 새 작업이 있습니다! 컴퓨터로 먼저 내려받으세요.", True
+
+    def check_large_files(self, folder_path, max_size_mb=98):
+        """
+        로컬 폴더 내에서 100MB 제한을 초과하는 대용량 파일을 스캔합니다.
+        .git 폴더와 이미 .gitignore로 무시되는 파일은 제외합니다.
+        """
+        large_files = []
+        if not os.path.isdir(folder_path):
+            return large_files
+
+        threshold_bytes = max_size_mb * 1024 * 1024
+
+        for root, dirs, files in os.walk(folder_path):
+            # .git 폴더 스킵
+            if ".git" in dirs:
+                dirs.remove(".git")
+
+            for file in files:
+                full_path = os.path.join(root, file)
+                try:
+                    size = os.path.getsize(full_path)
+                    if size >= threshold_bytes:
+                        rel_path = os.path.relpath(full_path, folder_path).replace("\\", "/")
+                        # 이미 .gitignore에 의해 무시되는지 확인
+                        if self.is_git_repo(folder_path):
+                            ok, _ = self._run_git(folder_path, ["check-ignore", "-q", rel_path])
+                            if ok:
+                                continue  # 이미 무시 중이면 제외
+
+                        size_mb = round(size / (1024 * 1024), 1)
+                        large_files.append({
+                            "rel_path": rel_path,
+                            "size_mb": size_mb,
+                            "full_path": full_path
+                        })
+                except (OSError, PermissionError):
+                    continue
+
+        return large_files
+
+    def ignore_large_files(self, folder_path, rel_paths):
+        """
+        대용량 파일들을 .gitignore에 추가하여 GitHub 업로드 차단을 방지합니다.
+        """
+        gitignore_path = os.path.join(folder_path, ".gitignore")
+        lines_to_add = []
+        existing = ""
+        if os.path.exists(gitignore_path):
+            try:
+                with open(gitignore_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            except Exception:
+                pass
+
+        for p in rel_paths:
+            # 특수문자나 띄어쓰기 대비 슬래시 정규화
+            norm_p = p.replace("\\", "/")
+            if norm_p not in existing:
+                lines_to_add.append(norm_p)
+
+        if lines_to_add:
+            try:
+                with open(gitignore_path, "a", encoding="utf-8") as f:
+                    f.write("\n# GitHub 100MB 초과 대용량 파일 자동 제외\n")
+                    for line in lines_to_add:
+                        f.write(f"/{line}\n")
+                return True
+            except Exception:
+                return False
+        return True
+
+    def get_commit_history(self, folder_path, limit=25):
+        """
+        로컬 저장소의 최근 커밋 기록을 조회합니다.
+        반환: [{"hash": ..., "short_hash": ..., "date": ..., "message": ...}]
+        """
+        if not self.is_git_repo(folder_path):
+            return []
+
+        cmd = [
+            "log",
+            f"--pretty=format:%H|%h|%ad|%s",
+            "--date=format:%Y-%m-%d %H:%M",
+            f"-n{limit}"
+        ]
+        ok, out = self._run_git(folder_path, cmd)
+        if not ok or not out.strip():
+            return []
+
+        history = []
+        for line in out.strip().splitlines():
+            parts = line.split("|", 3)
+            if len(parts) == 4:
+                history.append({
+                    "hash": parts[0],
+                    "short_hash": parts[1],
+                    "date": parts[2],
+                    "message": parts[3]
+                })
+        return history
+
+    def export_archive_at_commit(self, folder_path, commit_hash, output_zip_path):
+        """
+        특정 과거 커밋 시점의 전체 파일들을 안전하게 ZIP 파일로 추출합니다.
+        (현재 작업 중인 폴더의 파일을 전혀 건드리지 않습니다.)
+        """
+        if not self.is_git_repo(folder_path):
+            return False, "Git 저장소가 아닙니다."
+
+        cmd = ["archive", "--format=zip", f"--output={output_zip_path}", commit_hash]
+        ok, out = self._run_git(folder_path, cmd, timeout=120)
+        if ok:
+            return True, output_zip_path
+        return False, out
+
+    def restore_to_commit(self, folder_path, commit_hash):
+        """
+        현재 폴더의 파일들을 특정 과거 커밋 시점의 상태로 되돌립니다.
+        """
+        if not self.is_git_repo(folder_path):
+            return False, "Git 저장소가 아닙니다."
+
+        cmd = ["checkout", commit_hash, "--", "."]
+        ok, out = self._run_git(folder_path, cmd)
+        if ok:
+            return True, "선택한 시점의 파일로 복원되었습니다."
+        return False, out

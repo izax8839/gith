@@ -110,3 +110,26 @@ class GitHubAPI:
                 return False, f"생성 실패 ({res.status_code}): {res.text}"
         except Exception as e:
             return False, f"저장소 생성 중 오류: {str(e)}"
+
+    @classmethod
+    def check_latest_release(cls, token: str = "", repo_full_name: str = "izax8839/gith"):
+        """
+        GitHub Releases에서 최신 배포 버전을 확인합니다.
+        """
+        if not repo_full_name:
+            return False, None
+
+        url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/releases/latest"
+        try:
+            res = requests.get(url, headers=cls._get_headers(token), timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                return True, {
+                    "tag_name": data.get("tag_name", ""),
+                    "name": data.get("name", ""),
+                    "html_url": data.get("html_url", ""),
+                    "body": data.get("body", "")
+                }
+            return False, None
+        except Exception:
+            return False, None

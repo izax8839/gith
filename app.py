@@ -8,10 +8,28 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+from PIL import Image
+import pystray
+from pystray import MenuItem as item
 
 from config_manager import load_config, save_config
 from github_api import GitHubAPI
 from git_engine import GitEngine, find_git_executable, install_git_via_winget, is_winget_available
+import win_autostart
+
+APP_VERSION = "v1.2.0"
+APP_MUTEX_NAME = "GitSync_Desktop_App_Single_Instance_Mutex_Global"
+APP_WINDOW_TITLE = "깃싱크 (GitSync) - 초간편 한글 GitHub 폴더 동기화"
+
+def is_newer_version(remote_tag, current_ver):
+    """원격 배포 버전이 현재 프로그램 버전보다 높은지 비교합니다."""
+    try:
+        def parse_v(v_str):
+            cleaned = v_str.lower().lstrip("v").strip()
+            return [int(x) for x in cleaned.split(".") if x.isdigit()]
+        return parse_v(remote_tag) > parse_v(current_ver)
+    except Exception:
+        return False
 
 # 기본 테마 설정
 ctk.set_appearance_mode("System")  # System, Dark, Light
@@ -33,6 +51,7 @@ SUB_BTN_BG = ("#f1f5f9", "#1f2937")
 SUB_BTN_TEXT = ("#334155", "#e2e8f0")
 SUB_BTN_BORDER = ("#cbd5e1", "#374151")
 SUB_BTN_HOVER = ("#e2e8f0", "#374151")
+
 
 class TokenGuideDialog(ctk.CTkToplevel):
     def __init__(self, parent):
@@ -105,7 +124,6 @@ class TokenGuideDialog(ctk.CTkToplevel):
         close_btn.pack(side="right", padx=10)
 
     def open_token_page(self):
-        # repo 권한이 미리 체크된 URL
         url = "https://github.com/settings/tokens/new?description=GitSync_App&scopes=repo"
         webbrowser.open(url)
 
@@ -185,6 +203,266 @@ class NewRepoDialog(ctk.CTkToplevel):
             messagebox.showerror("생성 실패", f"저장소 생성에 실패했습니다:\n{res}")
 
 
+class LargeFileDialog(ctk.CTkToplevel):
+    """GitHub 100MB 초과 파일 사전 감지 경고 및 원클릭 .gitignore 처리 다이얼로그"""
+    def __init__(self, parent, large_files, on_ignore_and_continue, on_cancel):
+        super().__init__(parent)
+        self.large_files = large_files
+        self.on_ignore_and_continue = on_ignore_and_continue
+        self.on_cancel = on_cancel
+
+        self.title("대용량 파일 감지 (GitHub 100MB 제한)")
+        self.geometry("600x450")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+
+        frame = ctk.CTkFrame(self, corner_radius=12)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        title_lbl = ctk.CTkLabel(
+            frame,
+            text="⚠️ 100MB 초과 대용량 파일 감지",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=16, weight="bold"),
+            text_color="#d97706"
+        )
+        title_lbl.pack(pady=(12, 6))
+
+        desc_lbl = ctk.CTkLabel(
+            frame,
+            text="GitHub은 100MB 이상의 대용량 파일 업로드를 원천 차단합니다.\n해당 파일이 포함되면 업로드 오류가 발생하므로 제외(.gitignore 등록)를 권장합니다.",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            justify="center",
+            text_color=("#475569", "#cbd5e1")
+        )
+        desc_lbl.pack(pady=(0, 10))
+
+        # 파일 목록 박스
+        list_box = ctk.CTkTextbox(frame, height=200, font=ctk.CTkFont(family="Consolas", size=11))
+        list_box.pack(fill="both", expand=True, padx=15, pady=5)
+        for f in large_files:
+            list_box.insert("end", f"• {f['rel_path']}  ({f['size_mb']} MB)\n")
+        list_box.configure(state="disabled")
+
+        btn_row = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(14, 8), padx=15)
+
+        ignore_btn = ctk.CTkButton(
+            btn_row,
+            text="⚡ 위 파일들 제외(.gitignore 등록)하고 동기화 계속",
+            height=38,
+            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            fg_color="#059669",
+            hover_color="#047857",
+            command=self._confirm
+        )
+        ignore_btn.pack(side="left", expand=True, padx=(0, 6))
+
+        cancel_btn = ctk.CTkButton(
+            btn_row,
+            text="동기화 취소",
+            width=90,
+            height=38,
+            corner_radius=8,
+            fg_color=SUB_BTN_BG,
+            text_color=SUB_BTN_TEXT,
+            border_width=1,
+            border_color=SUB_BTN_BORDER,
+            hover_color=SUB_BTN_HOVER,
+            command=self._cancel
+        )
+        cancel_btn.pack(side="right")
+
+    def _confirm(self):
+        self.destroy()
+        if self.on_ignore_and_continue:
+            self.on_ignore_and_continue()
+
+    def _cancel(self):
+        self.destroy()
+        if self.on_cancel:
+            self.on_cancel()
+
+
+class HistoryDialog(ctk.CTkToplevel):
+    """과거 커밋 시점 히스토리 뷰어, ZIP 다운로드 및 롤백 복원 다이얼로그"""
+    def __init__(self, parent, git_engine, folder_path):
+        super().__init__(parent)
+        self.parent = parent
+        self.git_engine = git_engine
+        self.folder_path = folder_path
+
+        self.title("동기화 버전 히스토리 & 백업 복원")
+        self.geometry("760x560")
+        self.minsize(720, 520)
+        self.attributes("-topmost", True)
+
+        frame = ctk.CTkFrame(self, corner_radius=12)
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", padx=16, pady=(12, 4))
+
+        ctk.CTkLabel(
+            header,
+            text="🕒 동기화 버전 히스토리 (과거 시점 복원)",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=16, weight="bold")
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            frame,
+            text="과거 동기화 시점을 선택하여 현재 폴더 손상 없이 ZIP 파일로 내려받거나, 현재 폴더를 되돌릴 수 있습니다.",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            text_color=("#64748b", "#94a3b8")
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # 커밋 리스트박스 스크롤 프레임
+        self.scroll_frame = ctk.CTkScrollableFrame(frame, corner_radius=8, height=310)
+        self.scroll_frame.pack(fill="both", expand=True, padx=16, pady=5)
+
+        self.selected_commit = None
+        self.commit_radio_var = ctk.StringVar(value="")
+
+        # 하단 액션 버튼 영역
+        action_bar = ctk.CTkFrame(frame, fg_color="transparent")
+        action_bar.pack(fill="x", padx=16, pady=(12, 10))
+
+        self.info_lbl = ctk.CTkLabel(
+            action_bar,
+            text="목록에서 복원할 시점을 선택해주세요.",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            text_color=("#475569", "#cbd5e1")
+        )
+        self.info_lbl.pack(side="left")
+
+        btn_box = ctk.CTkFrame(action_bar, fg_color="transparent")
+        btn_box.pack(side="right")
+
+        self.export_zip_btn = ctk.CTkButton(
+            btn_box,
+            text="📦 이 시점 파일들 ZIP 다운로드",
+            height=36,
+            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            fg_color=("#0969da", "#0969da"),
+            hover_color=("#0860ca", "#0860ca"),
+            state="disabled",
+            command=self._export_zip
+        )
+        self.export_zip_btn.pack(side="left", padx=(0, 6))
+
+        self.restore_btn = ctk.CTkButton(
+            btn_box,
+            text="⏪ 현재 폴더를 이 시점으로 되돌리기",
+            height=36,
+            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            fg_color=("#dc2626", "#b91c1c"),
+            hover_color=("#b91c1c", "#991b1b"),
+            state="disabled",
+            command=self._restore_folder
+        )
+        self.restore_btn.pack(side="left")
+
+        self._load_history()
+
+    def _load_history(self):
+        history = self.git_engine.get_commit_history(self.folder_path, limit=30)
+        if not history:
+            ctk.CTkLabel(
+                self.scroll_frame,
+                text="동기화 기록이 없습니다. (아직 커밋이 생성되지 않았습니다)",
+                font=ctk.CTkFont(family=FONT_FAMILY, size=13)
+            ).pack(pady=40)
+            return
+
+        for idx, item in enumerate(history):
+            card = ctk.CTkFrame(
+                self.scroll_frame,
+                corner_radius=8,
+                fg_color=("#f8fafc", "#0f172a"),
+                border_width=1,
+                border_color=("#e2e8f0", "#1e293b")
+            )
+            card.pack(fill="x", padx=4, pady=3)
+
+            rb = ctk.CTkRadioButton(
+                card,
+                text="",
+                value=item["hash"],
+                variable=self.commit_radio_var,
+                width=24,
+                command=lambda h=item: self._on_select(h)
+            )
+            rb.pack(side="left", padx=(10, 5), pady=8)
+
+            txt_box = ctk.CTkFrame(card, fg_color="transparent")
+            txt_box.pack(side="left", fill="x", expand=True, padx=5, pady=6)
+
+            title_row = ctk.CTkFrame(txt_box, fg_color="transparent")
+            title_row.pack(fill="x")
+
+            msg_lbl = ctk.CTkLabel(title_row, text=item["message"], font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"))
+            msg_lbl.pack(side="left")
+
+            meta_lbl = ctk.CTkLabel(
+                txt_box,
+                text=f"동기화 시각: {item['date']}  |  버전 ID: {item['short_hash']}",
+                font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+                text_color="gray"
+            )
+            meta_lbl.pack(anchor="w")
+
+            if idx == 0:
+                rb.select()
+                self._on_select(item)
+
+    def _on_select(self, item):
+        self.selected_commit = item
+        self.info_lbl.configure(text=f"선택됨: [{item['short_hash']}] {item['date']}")
+        self.export_zip_btn.configure(state="normal")
+        self.restore_btn.configure(state="normal")
+
+    def _export_zip(self):
+        if not self.selected_commit:
+            return
+        clean_date = self.selected_commit['date'].replace('-', '').replace(' ', '_').replace(':', '')
+        default_name = f"GitSync_백업_{clean_date}.zip"
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        zip_path = filedialog.asksaveasfilename(
+            initialdir=desktop,
+            initialfile=default_name,
+            defaultextension=".zip",
+            filetypes=[("ZIP 압축 파일", "*.zip")]
+        )
+        if not zip_path:
+            return
+
+        ok, out = self.git_engine.export_archive_at_commit(self.folder_path, self.selected_commit["hash"], zip_path)
+        if ok:
+            messagebox.showinfo("ZIP 저장 완료", f"선택한 시점의 모든 파일이 압축되어 저장되었습니다!\n\n저장 위치:\n{zip_path}")
+        else:
+            messagebox.showerror("추출 실패", f"ZIP 생성 중 오류:\n{out}")
+
+    def _restore_folder(self):
+        if not self.selected_commit:
+            return
+        ans = messagebox.askyesno(
+            "시점 되돌리기 경고",
+            f"선택한 시점({self.selected_commit['date']})으로 현재 폴더의 모든 파일을 되돌리시겠습니까?\n\n"
+            f"※ 주의: 현재 폴더의 파일들이 해당 시점으로 복원됩니다."
+        )
+        if not ans:
+            return
+
+        ok, msg = self.git_engine.restore_to_commit(self.folder_path, self.selected_commit["hash"])
+        if ok:
+            messagebox.showinfo("복원 완료", "현재 폴더의 파일들이 선택한 시점으로 복원되었습니다.")
+            self.destroy()
+        else:
+            messagebox.showerror("복원 실패", f"복원 중 오류:\n{msg}")
+
+
 class GitSyncApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -192,28 +470,20 @@ class GitSyncApp(ctk.CTk):
         # 작업표시줄 아이콘 분리 설정 (Windows)
         try:
             import ctypes
-            myappid = "gitsync.desktop.app.1.0"
+            myappid = "gitsync.desktop.app.1.2"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
         except Exception:
             pass
 
-        self.title("깃싱크 (GitSync) - 초간편 한글 GitHub 폴더 동기화")
-        self.geometry("860x860")
-        self.minsize(820, 800)
+        self.title(APP_WINDOW_TITLE)
+        self.geometry("880x900")
+        self.minsize(820, 820)
 
         # 창 아이콘 설정
-        if getattr(sys, "frozen", False):
-            base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-        else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-
-        icon_path = os.path.join(base_dir, "app_icon.ico")
-        if not os.path.exists(icon_path):
-            icon_path = os.path.join(os.path.dirname(sys.executable), "app_icon.ico")
-
-        if os.path.exists(icon_path):
+        self.icon_path = self._get_app_icon_path()
+        if os.path.exists(self.icon_path):
             try:
-                self.iconbitmap(icon_path)
+                self.iconbitmap(self.icon_path)
             except Exception:
                 pass
 
@@ -222,30 +492,66 @@ class GitSyncApp(ctk.CTk):
         self.repos_list = []  # GitHub에서 가져온 저장소 목록
         self.is_syncing = False
         self.auto_sync_timer = None
+        self.tray_icon = None
+        self._first_tray_notify = True
 
         self._build_ui()
         self._load_saved_settings()
         self._check_git_status()
+        self._setup_tray_icon()
+
+        # 창 닫기 버튼 이벤트 가로채기 (트레이 최소화 처리)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+    def _get_app_icon_path(self):
+        if getattr(sys, "frozen", False):
+            base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        icon_path = os.path.join(base_dir, "app_icon.ico")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join(os.path.dirname(sys.executable), "app_icon.ico")
+        return icon_path
 
     def _build_ui(self):
         # 메인 그리드 레이아웃
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
-        # 1. 헤더 영역 (Row 0 - 미니멀 투명 프레임)
+        # 1. 헤더 영역 (Row 0)
         header_frame = ctk.CTkFrame(self, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=22, pady=(18, 10), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=22, pady=(16, 8), sticky="ew")
         header_frame.grid_columnconfigure(0, weight=1)
 
         title_box = ctk.CTkFrame(header_frame, fg_color="transparent")
         title_box.pack(side="left")
 
+        title_row = ctk.CTkFrame(title_box, fg_color="transparent")
+        title_row.pack(anchor="w")
+
         logo_lbl = ctk.CTkLabel(
-            title_box,
+            title_row,
             text="🐙 깃싱크  GitSync",
             font=ctk.CTkFont(family=FONT_FAMILY, size=22, weight="bold")
         )
-        logo_lbl.pack(anchor="w")
+        logo_lbl.pack(side="left")
+
+        self.version_badge = ctk.CTkButton(
+            title_row,
+            text=APP_VERSION,
+            width=55,
+            height=22,
+            corner_radius=11,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color=SUB_BTN_BG,
+            text_color=SUB_BTN_TEXT,
+            border_width=1,
+            border_color=SUB_BTN_BORDER,
+            hover_color=SUB_BTN_HOVER,
+            command=self._manual_check_update
+        )
+        self.version_badge.pack(side="left", padx=(10, 0))
 
         sub_lbl = ctk.CTkLabel(
             title_box,
@@ -281,7 +587,55 @@ class GitSyncApp(ctk.CTk):
         self.theme_btn.set("시스템")
         self.theme_btn.pack(side="left")
 
-        # Git 미설치 알림 배너 (Row 1 - 미설치 시에만 표시)
+        # 새 버전 업데이트 알림 배너 (Row 1)
+        self.update_banner_frame = ctk.CTkFrame(
+            self,
+            corner_radius=10,
+            fg_color=("#eff6ff", "#172554"),
+            border_color=("#60a5fa", "#2563eb"),
+            border_width=1
+        )
+        self.update_banner_frame.grid_columnconfigure(0, weight=1)
+
+        banner_inner = ctk.CTkFrame(self.update_banner_frame, fg_color="transparent")
+        banner_inner.pack(fill="x", padx=16, pady=8)
+
+        self.update_msg_lbl = ctk.CTkLabel(
+            banner_inner,
+            text="🎉 새로운 업데이트가 있습니다!",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            text_color=("#1d4ed8", "#93c5fd")
+        )
+        self.update_msg_lbl.pack(side="left")
+
+        update_btn_box = ctk.CTkFrame(banner_inner, fg_color="transparent")
+        update_btn_box.pack(side="right")
+
+        self.update_download_btn = ctk.CTkButton(
+            update_btn_box,
+            text="🌐 다운로드 페이지 열기",
+            height=28,
+            corner_radius=6,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8"
+        )
+        self.update_download_btn.pack(side="left", padx=(0, 6))
+
+        close_update_btn = ctk.CTkButton(
+            update_btn_box,
+            text="✕",
+            width=28,
+            height=28,
+            corner_radius=6,
+            fg_color=SUB_BTN_BG,
+            text_color=SUB_BTN_TEXT,
+            hover_color=SUB_BTN_HOVER,
+            command=self.update_banner_frame.grid_remove
+        )
+        close_update_btn.pack(side="left")
+
+        # Git 미설치 알림 배너 (Row 2 - 미설치 시에만 표시)
         self.git_banner_frame = ctk.CTkFrame(
             self,
             corner_radius=12,
@@ -339,7 +693,7 @@ class GitSyncApp(ctk.CTk):
         )
         web_git_btn.pack(side="left")
 
-        # 2. 계정 설정 영역 (Card 1 - Row 2)
+        # 2. 계정 설정 영역 (Card 1 - Row 3)
         acc_frame = ctk.CTkFrame(
             self,
             corner_radius=14,
@@ -347,7 +701,7 @@ class GitSyncApp(ctk.CTk):
             border_color=CARD_BORDER,
             border_width=1
         )
-        acc_frame.grid(row=2, column=0, padx=22, pady=6, sticky="ew")
+        acc_frame.grid(row=3, column=0, padx=22, pady=5, sticky="ew")
         acc_frame.grid_columnconfigure(1, weight=1)
 
         acc_title = ctk.CTkLabel(
@@ -355,7 +709,7 @@ class GitSyncApp(ctk.CTk):
             text="1. GitHub 계정 연결",
             font=ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
         )
-        acc_title.grid(row=0, column=0, columnspan=3, padx=18, pady=(14, 8), sticky="w")
+        acc_title.grid(row=0, column=0, columnspan=3, padx=18, pady=(12, 6), sticky="w")
 
         # 사용자명
         ctk.CTkLabel(
@@ -363,24 +717,24 @@ class GitSyncApp(ctk.CTk):
             text="GitHub 아이디",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
             text_color=("#475569", "#cbd5e1")
-        ).grid(row=1, column=0, padx=18, pady=5, sticky="w")
+        ).grid(row=1, column=0, padx=18, pady=4, sticky="w")
 
         self.username_entry = ctk.CTkEntry(
             acc_frame,
             placeholder_text="GitHub 사용자 이름 (예: myid)",
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=INPUT_BG,
             border_color=INPUT_BORDER
         )
-        self.username_entry.grid(row=1, column=1, padx=(0, 10), pady=5, sticky="ew")
+        self.username_entry.grid(row=1, column=1, padx=(0, 10), pady=4, sticky="ew")
 
-        # 토큰 발급 가이드 버튼 (모던 라일락 스타일)
+        # 토큰 발급 가이드 버튼
         guide_btn = ctk.CTkButton(
             acc_frame,
             text="🔑 토큰 발급 가이드",
             width=135,
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=("#f5f3ff", "#2e1065"),
             text_color=("#7c3aed", "#c4b5fd"),
@@ -390,7 +744,7 @@ class GitSyncApp(ctk.CTk):
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
             command=self._show_token_guide
         )
-        guide_btn.grid(row=1, column=2, padx=(0, 18), pady=5, sticky="e")
+        guide_btn.grid(row=1, column=2, padx=(0, 18), pady=4, sticky="e")
 
         # 토큰 입력창 (비밀번호 대체)
         ctk.CTkLabel(
@@ -398,17 +752,17 @@ class GitSyncApp(ctk.CTk):
             text="개인 토큰 (비밀번호)",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
             text_color=("#475569", "#cbd5e1")
-        ).grid(row=2, column=0, padx=18, pady=5, sticky="w")
-        
+        ).grid(row=2, column=0, padx=18, pady=4, sticky="w")
+
         token_subframe = ctk.CTkFrame(acc_frame, fg_color="transparent")
-        token_subframe.grid(row=2, column=1, padx=(0, 10), pady=5, sticky="ew")
+        token_subframe.grid(row=2, column=1, padx=(0, 10), pady=4, sticky="ew")
         token_subframe.grid_columnconfigure(0, weight=1)
 
         self.token_entry = ctk.CTkEntry(
             token_subframe,
             placeholder_text="ghp_로 시작하는 개인 액세스 토큰 붙여넣기",
             show="*",
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=INPUT_BG,
             border_color=INPUT_BORDER
@@ -418,8 +772,8 @@ class GitSyncApp(ctk.CTk):
         self.show_token_btn = ctk.CTkButton(
             token_subframe,
             text="👁️",
-            width=38,
-            height=38,
+            width=36,
+            height=36,
             corner_radius=8,
             fg_color=SUB_BTN_BG,
             text_color=SUB_BTN_TEXT,
@@ -435,18 +789,18 @@ class GitSyncApp(ctk.CTk):
             acc_frame,
             text="🔗 연결 & 저장소 불러오기",
             width=165,
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=ACCENT_PRIMARY,
             hover_color=ACCENT_PRIMARY_HOVER,
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
             command=self._on_click_connect
         )
-        self.connect_btn.grid(row=2, column=2, padx=(0, 18), pady=5, sticky="e")
+        self.connect_btn.grid(row=2, column=2, padx=(0, 18), pady=4, sticky="e")
 
-        # 계정 상태 문구 및 저장 옵션
+        # 계정 상태 문구 및 3대 시스템 옵션 체크박스
         status_row = ctk.CTkFrame(acc_frame, fg_color="transparent")
-        status_row.grid(row=3, column=0, columnspan=3, padx=18, pady=(8, 14), sticky="ew")
+        status_row.grid(row=3, column=0, columnspan=3, padx=18, pady=(6, 12), sticky="ew")
         status_row.grid_columnconfigure(0, weight=1)
 
         self.account_status_lbl = ctk.CTkLabel(
@@ -457,17 +811,40 @@ class GitSyncApp(ctk.CTk):
         )
         self.account_status_lbl.grid(row=0, column=0, sticky="w")
 
+        options_box = ctk.CTkFrame(status_row, fg_color="transparent")
+        options_box.grid(row=0, column=1, sticky="e")
+
         self.remember_var = ctk.BooleanVar(value=True)
         self.remember_chk = ctk.CTkCheckBox(
-            status_row,
-            text="토큰 및 설정 자동 저장",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            options_box,
+            text="토큰 저장",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
             variable=self.remember_var,
             command=self._save_current_settings
         )
-        self.remember_chk.grid(row=0, column=1, sticky="e")
+        self.remember_chk.pack(side="left", padx=5)
 
-        # 3. 동기화 대상 설정 (Card 2 - Row 3)
+        self.tray_var = ctk.BooleanVar(value=True)
+        self.tray_chk = ctk.CTkCheckBox(
+            options_box,
+            text="트레이 최소화",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            variable=self.tray_var,
+            command=self._save_current_settings
+        )
+        self.tray_chk.pack(side="left", padx=5)
+
+        self.autostart_var = ctk.BooleanVar(value=False)
+        self.autostart_chk = ctk.CTkCheckBox(
+            options_box,
+            text="부팅 시 자동실행",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            variable=self.autostart_var,
+            command=self._on_toggle_autostart
+        )
+        self.autostart_chk.pack(side="left", padx=5)
+
+        # 3. 동기화 대상 설정 (Card 2 - Row 4: 다중 프로필 관리 탑재)
         target_frame = ctk.CTkFrame(
             self,
             corner_radius=14,
@@ -475,7 +852,7 @@ class GitSyncApp(ctk.CTk):
             border_color=CARD_BORDER,
             border_width=1
         )
-        target_frame.grid(row=3, column=0, padx=22, pady=6, sticky="ew")
+        target_frame.grid(row=4, column=0, padx=22, pady=5, sticky="ew")
         target_frame.grid_columnconfigure(1, weight=1)
 
         target_title = ctk.CTkLabel(
@@ -483,34 +860,108 @@ class GitSyncApp(ctk.CTk):
             text="2. 동기화 대상 설정 (내 컴퓨터 폴더 ↔ GitHub 저장소)",
             font=ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
         )
-        target_title.grid(row=0, column=0, columnspan=3, padx=18, pady=(14, 8), sticky="w")
+        target_title.grid(row=0, column=0, columnspan=3, padx=18, pady=(12, 6), sticky="w")
 
-        # 로컬 폴더
+        # [신규 기능] 프로필 전환/추가/삭제 줄 (Row 1)
+        profile_row = ctk.CTkFrame(target_frame, fg_color="transparent")
+        profile_row.grid(row=1, column=0, columnspan=3, padx=18, pady=(0, 6), sticky="ew")
+        profile_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            profile_row,
+            text="📁 프로젝트 프로필",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
+            text_color=("#475569", "#cbd5e1")
+        ).grid(row=0, column=0, padx=(0, 10), sticky="w")
+
+        self.profile_combo = ctk.CTkComboBox(
+            profile_row,
+            values=["기본 작업"],
+            height=34,
+            corner_radius=8,
+            fg_color=INPUT_BG,
+            border_color=INPUT_BORDER,
+            command=self._on_profile_change
+        )
+        self.profile_combo.grid(row=0, column=1, padx=(0, 8), sticky="ew")
+
+        profile_btn_box = ctk.CTkFrame(profile_row, fg_color="transparent")
+        profile_btn_box.grid(row=0, column=2, sticky="e")
+
+        add_profile_btn = ctk.CTkButton(
+            profile_btn_box,
+            text="➕ 새 프로필",
+            width=85,
+            height=34,
+            corner_radius=8,
+            fg_color=SUB_BTN_BG,
+            text_color=SUB_BTN_TEXT,
+            border_width=1,
+            border_color=SUB_BTN_BORDER,
+            hover_color=SUB_BTN_HOVER,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            command=self._add_profile
+        )
+        add_profile_btn.pack(side="left", padx=(0, 4))
+
+        rename_profile_btn = ctk.CTkButton(
+            profile_btn_box,
+            text="✏️ 이름 변경",
+            width=85,
+            height=34,
+            corner_radius=8,
+            fg_color=SUB_BTN_BG,
+            text_color=SUB_BTN_TEXT,
+            border_width=1,
+            border_color=SUB_BTN_BORDER,
+            hover_color=SUB_BTN_HOVER,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            command=self._rename_profile
+        )
+        rename_profile_btn.pack(side="left", padx=(0, 4))
+
+        del_profile_btn = ctk.CTkButton(
+            profile_btn_box,
+            text="🗑️ 삭제",
+            width=60,
+            height=34,
+            corner_radius=8,
+            fg_color=SUB_BTN_BG,
+            text_color=("#ef4444", "#f87171"),
+            border_width=1,
+            border_color=SUB_BTN_BORDER,
+            hover_color=SUB_BTN_HOVER,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            command=self._delete_profile
+        )
+        del_profile_btn.pack(side="left")
+
+        # 로컬 폴더 (Row 2)
         ctk.CTkLabel(
             target_frame,
             text="내 컴퓨터 폴더",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
             text_color=("#475569", "#cbd5e1")
-        ).grid(row=1, column=0, padx=18, pady=5, sticky="w")
+        ).grid(row=2, column=0, padx=18, pady=4, sticky="w")
 
         self.folder_entry = ctk.CTkEntry(
             target_frame,
             placeholder_text="동기화할 컴퓨터 폴더 경로 (예: C:\\Users\\...\\Desktop\\내폴더)",
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=INPUT_BG,
             border_color=INPUT_BORDER
         )
-        self.folder_entry.grid(row=1, column=1, padx=(0, 10), pady=5, sticky="ew")
+        self.folder_entry.grid(row=2, column=1, padx=(0, 10), pady=4, sticky="ew")
 
         folder_btn_row = ctk.CTkFrame(target_frame, fg_color="transparent")
-        folder_btn_row.grid(row=1, column=2, padx=(0, 18), pady=5, sticky="e")
+        folder_btn_row.grid(row=2, column=2, padx=(0, 18), pady=4, sticky="e")
 
         browse_btn = ctk.CTkButton(
             folder_btn_row,
             text="📁 폴더 선택...",
             width=100,
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=SUB_BTN_BG,
             text_color=SUB_BTN_TEXT,
@@ -526,7 +977,7 @@ class GitSyncApp(ctk.CTk):
             folder_btn_row,
             text="📂 열기",
             width=58,
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=SUB_BTN_BG,
             text_color=SUB_BTN_TEXT,
@@ -538,33 +989,33 @@ class GitSyncApp(ctk.CTk):
         )
         open_folder_btn.pack(side="left")
 
-        # GitHub 저장소
+        # GitHub 저장소 (Row 3)
         ctk.CTkLabel(
             target_frame,
             text="GitHub 저장소",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
             text_color=("#475569", "#cbd5e1")
-        ).grid(row=2, column=0, padx=18, pady=5, sticky="w")
-        
+        ).grid(row=3, column=0, padx=18, pady=4, sticky="w")
+
         self.repo_combo = ctk.CTkComboBox(
             target_frame,
             values=["[계정을 연결하여 저장소 목록을 불러오세요]"],
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=INPUT_BG,
             border_color=INPUT_BORDER,
             command=self._on_repo_selected
         )
-        self.repo_combo.grid(row=2, column=1, padx=(0, 10), pady=(5, 14), sticky="ew")
+        self.repo_combo.grid(row=3, column=1, padx=(0, 10), pady=(4, 12), sticky="ew")
 
         repo_btn_row = ctk.CTkFrame(target_frame, fg_color="transparent")
-        repo_btn_row.grid(row=2, column=2, padx=(0, 18), pady=(5, 14), sticky="e")
+        repo_btn_row.grid(row=3, column=2, padx=(0, 18), pady=(4, 12), sticky="e")
 
         new_repo_btn = ctk.CTkButton(
             repo_btn_row,
             text="➕ 새 저장소",
             width=100,
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=ACCENT_GREEN,
             hover_color=ACCENT_GREEN_HOVER,
@@ -577,7 +1028,7 @@ class GitSyncApp(ctk.CTk):
             repo_btn_row,
             text="🌐 웹",
             width=58,
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=SUB_BTN_BG,
             text_color=SUB_BTN_TEXT,
@@ -589,7 +1040,7 @@ class GitSyncApp(ctk.CTk):
         )
         open_repo_web_btn.pack(side="left")
 
-        # 4. 동기화 실행 및 자동화 영역 (Card 3 - Row 4)
+        # 4. 동기화 실행 및 복원 영역 (Card 3 - Row 5)
         action_frame = ctk.CTkFrame(
             self,
             corner_radius=14,
@@ -597,18 +1048,37 @@ class GitSyncApp(ctk.CTk):
             border_color=CARD_BORDER,
             border_width=1
         )
-        action_frame.grid(row=4, column=0, padx=22, pady=(6, 16), sticky="nsew")
+        action_frame.grid(row=5, column=0, padx=22, pady=(5, 14), sticky="nsew")
         action_frame.grid_columnconfigure(0, weight=2)
         action_frame.grid_columnconfigure(1, weight=1)
         action_frame.grid_columnconfigure(2, weight=1)
         action_frame.grid_rowconfigure(7, weight=1)
 
-        action_title = ctk.CTkLabel(
-            action_frame,
+        # Card 3 헤더: 제목 + [신규 기능] 과거 시점 버전 복원 뷰어 열기 버튼
+        action_header = ctk.CTkFrame(action_frame, fg_color="transparent")
+        action_header.grid(row=0, column=0, columnspan=3, padx=18, pady=(12, 6), sticky="ew")
+
+        ctk.CTkLabel(
+            action_header,
             text="3. 동기화 실행",
             font=ctk.CTkFont(family=FONT_FAMILY, size=15, weight="bold")
+        ).pack(side="left")
+
+        # [신규 기능] 어제 버전으로 되돌리기 (버전 복원 뷰어) 버튼
+        history_btn = ctk.CTkButton(
+            action_header,
+            text="🕒 버전 히스토리 & 백업 복원 (되돌리기)",
+            height=32,
+            corner_radius=8,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color=("#f3e8ff", "#3b0764"),
+            text_color=("#7e22ce", "#e9d5ff"),
+            border_width=1,
+            border_color=("#d8b4fe", "#6b21a8"),
+            hover_color=("#e9d5ff", "#581c87"),
+            command=self._open_history_dialog
         )
-        action_title.grid(row=0, column=0, columnspan=3, padx=18, pady=(14, 6), sticky="w")
+        history_btn.pack(side="right")
 
         # 스마트 동기화 상태 감지 배너 (Row 1)
         self.sync_status_banner = ctk.CTkFrame(
@@ -618,13 +1088,12 @@ class GitSyncApp(ctk.CTk):
             fg_color=("#f8fafc", "#0f172a"),
             border_color=("#e2e8f0", "#1e293b")
         )
-        self.sync_status_banner.grid(row=1, column=0, columnspan=3, padx=18, pady=(0, 10), sticky="ew")
+        self.sync_status_banner.grid(row=1, column=0, columnspan=3, padx=18, pady=(0, 8), sticky="ew")
         self.sync_status_banner.grid_columnconfigure(0, weight=1)
 
         banner_content = ctk.CTkFrame(self.sync_status_banner, fg_color="transparent")
-        banner_content.pack(fill="x", padx=14, pady=10)
+        banner_content.pack(fill="x", padx=14, pady=8)
 
-        # 상태 텍스트
         status_text_box = ctk.CTkFrame(banner_content, fg_color="transparent")
         status_text_box.pack(side="left", fill="x", expand=True)
 
@@ -644,27 +1113,25 @@ class GitSyncApp(ctk.CTk):
         )
         self.status_desc_lbl.pack(anchor="w", pady=(1, 0))
 
-        # 우측 액션 버튼들
         banner_actions = ctk.CTkFrame(banner_content, fg_color="transparent")
         banner_actions.pack(side="right")
 
         self.status_quick_pull_btn = ctk.CTkButton(
             banner_actions,
             text="⬇️ 지금 내려받기",
-            height=32,
+            height=30,
             corner_radius=6,
             font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
             fg_color="#0969da",
             hover_color="#0860ca",
             command=lambda: self._start_git_task("pull")
         )
-        # 기본은 숨김, BEHIND 상태일 때만 pack
 
         self.status_refresh_btn = ctk.CTkButton(
             banner_actions,
             text="🔄 상태 새로고침",
-            width=100,
-            height=32,
+            width=95,
+            height=30,
             corner_radius=6,
             font=ctk.CTkFont(family=FONT_FAMILY, size=11),
             fg_color=SUB_BTN_BG,
@@ -678,7 +1145,7 @@ class GitSyncApp(ctk.CTk):
 
         # 동기화 메모 / 제목 입력창 (Row 2)
         memo_frame = ctk.CTkFrame(action_frame, fg_color="transparent")
-        memo_frame.grid(row=2, column=0, columnspan=3, padx=18, pady=(2, 10), sticky="ew")
+        memo_frame.grid(row=2, column=0, columnspan=3, padx=18, pady=(0, 8), sticky="ew")
         memo_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
@@ -691,7 +1158,7 @@ class GitSyncApp(ctk.CTk):
         self.commit_msg_entry = ctk.CTkEntry(
             memo_frame,
             placeholder_text="예: 메인 시안 수정, 문서 1차 정리 등 (선택 사항, 비워두면 자동 기본값)",
-            height=38,
+            height=36,
             corner_radius=8,
             fg_color=INPUT_BG,
             border_color=INPUT_BORDER
@@ -709,21 +1176,20 @@ class GitSyncApp(ctk.CTk):
         self.sync_btn = ctk.CTkButton(
             action_frame,
             text="🚀  원클릭 전체 동기화\n(내려받기 + 올리기 일괄 처리)",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold"),
-            height=54,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
+            height=52,
             corner_radius=10,
             fg_color=("#4f46e5", "#4f46e5"),
             hover_color=("#4338ca", "#4338ca"),
             command=lambda: self._start_git_task("sync")
         )
-        self.sync_btn.grid(row=3, column=0, padx=(18, 6), pady=6, sticky="ew")
+        self.sync_btn.grid(row=3, column=0, padx=(18, 5), pady=5, sticky="ew")
 
-        # 서브 버튼 1 (내려받기만)
         self.pull_btn = ctk.CTkButton(
             action_frame,
             text="⬇️  내려받기만 (Pull)\n(GitHub 최신 파일 가져오기)",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
-            height=54,
+            height=52,
             corner_radius=10,
             fg_color=SUB_BTN_BG,
             text_color=SUB_BTN_TEXT,
@@ -732,14 +1198,13 @@ class GitSyncApp(ctk.CTk):
             hover_color=SUB_BTN_HOVER,
             command=lambda: self._start_git_task("pull")
         )
-        self.pull_btn.grid(row=3, column=1, padx=6, pady=6, sticky="ew")
+        self.pull_btn.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
 
-        # 서브 버튼 2 (올리기만)
         self.push_btn = ctk.CTkButton(
             action_frame,
             text="⬆️  올리기만 (Push)\n(내 컴퓨터 파일 업로드)",
             font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
-            height=54,
+            height=52,
             corner_radius=10,
             fg_color=SUB_BTN_BG,
             text_color=SUB_BTN_TEXT,
@@ -748,11 +1213,11 @@ class GitSyncApp(ctk.CTk):
             hover_color=SUB_BTN_HOVER,
             command=lambda: self._start_git_task("push")
         )
-        self.push_btn.grid(row=3, column=2, padx=(6, 18), pady=6, sticky="ew")
+        self.push_btn.grid(row=3, column=2, padx=(5, 18), pady=5, sticky="ew")
 
         # 자동 동기화 설정 (Row 4)
         auto_frame = ctk.CTkFrame(action_frame, fg_color="transparent")
-        auto_frame.grid(row=4, column=0, columnspan=3, padx=18, pady=(8, 4), sticky="ew")
+        auto_frame.grid(row=4, column=0, columnspan=3, padx=18, pady=(6, 4), sticky="ew")
 
         self.auto_sync_var = ctk.BooleanVar(value=False)
         self.auto_sync_chk = ctk.CTkCheckBox(
@@ -794,8 +1259,8 @@ class GitSyncApp(ctk.CTk):
 
         # 4. 실시간 로그 영역 (Row 5)
         log_header_frame = ctk.CTkFrame(action_frame, fg_color="transparent")
-        log_header_frame.grid(row=5, column=0, columnspan=3, padx=18, pady=(12, 4), sticky="ew")
-        
+        log_header_frame.grid(row=5, column=0, columnspan=3, padx=18, pady=(8, 4), sticky="ew")
+
         ctk.CTkLabel(
             log_header_frame,
             text="실시간 진행 상태 및 한글 로그",
@@ -827,7 +1292,7 @@ class GitSyncApp(ctk.CTk):
         # 터미널 스타일 로그 텍스트 박스 (Row 7)
         self.log_textbox = ctk.CTkTextbox(
             action_frame,
-            height=130,
+            height=125,
             corner_radius=8,
             font=ctk.CTkFont(family="Consolas", size=11),
             fg_color=("#0f172a", "#020617"),
@@ -835,12 +1300,14 @@ class GitSyncApp(ctk.CTk):
             border_width=1,
             border_color=("#1e293b", "#0f172a")
         )
-        self.log_textbox.grid(row=7, column=0, columnspan=3, padx=18, pady=(0, 18), sticky="nsew")
+        self.log_textbox.grid(row=7, column=0, columnspan=3, padx=18, pady=(0, 16), sticky="nsew")
 
+    # 테마 변경
     def _change_theme(self, value):
         mode_map = {"시스템": "System", "다크": "Dark", "라이트": "Light"}
         ctk.set_appearance_mode(mode_map.get(value, "System"))
 
+    # 가이드 & 서브 다이얼로그
     def _show_token_guide(self):
         TokenGuideDialog(self)
 
@@ -894,6 +1361,21 @@ class GitSyncApp(ctk.CTk):
 
         NewRepoDialog(self, token, _on_created)
 
+    def _open_history_dialog(self):
+        local_folder = self.folder_entry.get().strip()
+        if not local_folder or not os.path.isdir(local_folder):
+            messagebox.showwarning("폴더 확인", "먼저 동기화 대상 폴더를 선택해주세요.")
+            return
+
+        if not self.git_engine.is_git_repo(local_folder):
+            messagebox.showinfo(
+                "동기화 이력 없음",
+                "이 폴더는 아직 Git 동기화가 진행된 적이 없습니다.\n\n먼저 [원클릭 전체 동기화]를 1회 실행하시면 그때부터 과거 시점 기록이 저장되고 언제든 복원할 수 있습니다!"
+            )
+            return
+
+        HistoryDialog(self, self.git_engine, local_folder)
+
     def _log(self, message):
         now = datetime.now().strftime("%H:%M:%S")
         line = f"[{now}] {message}\n"
@@ -903,9 +1385,10 @@ class GitSyncApp(ctk.CTk):
     def _clear_log(self):
         self.log_textbox.delete("1.0", "end")
 
+    # Git 설치 및 상태
     def _check_git_status(self):
         if not self.git_engine.is_git_available():
-            self.git_banner_frame.grid(row=1, column=0, padx=22, pady=6, sticky="ew")
+            self.git_banner_frame.grid(row=2, column=0, padx=22, pady=5, sticky="ew")
             if hasattr(self, "git_status_btn"):
                 self.git_status_btn.configure(
                     text="⚠️  Git 미설치",
@@ -929,106 +1412,6 @@ class GitSyncApp(ctk.CTk):
                 )
             self._log(f"✅ Git 엔진 준비 완료: {self.git_engine.git_path}")
             self._set_git_ready(True)
-
-    def _trigger_inspect_status(self):
-        """로컬 폴더와 GitHub의 최신 변경사항을 백그라운드에서 가볍게 비교합니다."""
-        if self.is_syncing:
-            return
-
-        local_folder = self.folder_entry.get().strip() if hasattr(self, "folder_entry") else ""
-        raw_repo_url = self._get_selected_repo_url() if hasattr(self, "repo_combo") else ""
-        token = self.token_entry.get().strip() if hasattr(self, "token_entry") else ""
-        username = self.username_entry.get().strip() if hasattr(self, "username_entry") else ""
-        branch = self._get_selected_branch() if hasattr(self, "_get_selected_branch") else "main"
-
-        if not local_folder or not os.path.isdir(local_folder):
-            self._update_status_ui("NO_SETUP", "폴더 미선택", "동기화할 컴퓨터 폴더를 선택해주세요.", False)
-            return
-
-        if not raw_repo_url or not token:
-            self._update_status_ui("NO_SETUP", "저장소 연결 필요", "GitHub 계정 연결 및 저장소를 선택해주세요.", False)
-            return
-
-        auth_url = GitEngine.build_authenticated_url(raw_repo_url, username, token)
-
-        self.status_title_lbl.configure(text="🔍 동기화 상태 확인 중...", text_color=("#334155", "#94a3b8"))
-        self.status_desc_lbl.configure(text="GitHub과 로컬의 최신 변경사항을 비교하고 있습니다.")
-        self.status_refresh_btn.configure(state="disabled", text="확인 중...")
-
-        def _worker():
-            try:
-                code, title, desc, has_new = self.git_engine.inspect_sync_status(local_folder, auth_url, branch)
-                self.after(0, lambda: self._update_status_ui(code, title, desc, has_new))
-            except Exception as e:
-                self.after(0, lambda: self._update_status_ui("ERROR", "확인 실패", f"오류: {str(e)}", False))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _update_status_ui(self, code, title, desc, has_remote_new):
-        """진단 결과에 따라 상태 배너의 색상과 버튼을 스마트하게 갱신합니다."""
-        self.status_refresh_btn.configure(state="normal", text="🔄 상태 새로고침")
-
-        if code == "BEHIND":
-            # GitHub에 최신 파일이 있음 -> 파란색/하늘색 안내 + 원클릭 내려받기 퀵액션 버튼 노출!
-            self.sync_status_banner.configure(
-                fg_color=("#eff6ff", "#172554"),
-                border_color=("#93c5fd", "#1d4ed8")
-            )
-            self.status_title_lbl.configure(text=f"🔔 {title}", text_color=("#1d4ed8", "#93c5fd"))
-            self.status_desc_lbl.configure(text=desc, text_color=("#2563eb", "#bfdbfe"))
-            self.status_quick_pull_btn.pack(side="left", padx=(0, 8))
-            self.status_quick_pull_btn.configure(
-                text="⬇️ 지금 바로 내려받기",
-                fg_color="#0969da",
-                hover_color="#0860ca",
-                command=lambda: self._start_git_task("pull")
-            )
-
-        elif code == "UP_TO_DATE":
-            # 완벽 일치 -> 산뜻한 에메랄드 그린
-            self.status_quick_pull_btn.pack_forget()
-            self.sync_status_banner.configure(
-                fg_color=("#f0fdf4", "#052e16"),
-                border_color=("#86efac", "#15803d")
-            )
-            self.status_title_lbl.configure(text=f"✅ {title}", text_color=("#15803d", "#86efac"))
-            self.status_desc_lbl.configure(text=desc, text_color=("#16a34a", "#bbf7d0"))
-
-        elif code in ("LOCAL_MODIFIED", "AHEAD"):
-            # 컴퓨터에 새 작업이 있음 -> 보라/인디고
-            self.status_quick_pull_btn.pack_forget()
-            self.sync_status_banner.configure(
-                fg_color=("#eef2ff", "#1e1b4b"),
-                border_color=("#a5b4fc", "#4338ca")
-            )
-            self.status_title_lbl.configure(text=f"⬆️ {title}", text_color=("#4338ca", "#a5b4fc"))
-            self.status_desc_lbl.configure(text=desc, text_color=("#4f46e5", "#c7d2fe"))
-
-        elif code == "DIVERGED":
-            # 양쪽 모두 수정됨 -> 주황색 경고
-            self.sync_status_banner.configure(
-                fg_color=("#fffbeb", "#451a03"),
-                border_color=("#fde68a", "#b45309")
-            )
-            self.status_title_lbl.configure(text=f"⚠️ {title}", text_color=("#b45309", "#fde68a"))
-            self.status_desc_lbl.configure(text=desc, text_color=("#92400e", "#fef3c7"))
-            self.status_quick_pull_btn.pack(side="left", padx=(0, 8))
-            self.status_quick_pull_btn.configure(
-                text="🚀 지금 전체 동기화",
-                fg_color="#d97706",
-                hover_color="#b45309",
-                command=lambda: self._start_git_task("sync")
-            )
-
-        else:
-            # 기타 (준비 중, 미선택)
-            self.status_quick_pull_btn.pack_forget()
-            self.sync_status_banner.configure(
-                fg_color=("#f8fafc", "#0f172a"),
-                border_color=("#e2e8f0", "#1e293b")
-            )
-            self.status_title_lbl.configure(text=f"ℹ️ {title}", text_color=("#475569", "#cbd5e1"))
-            self.status_desc_lbl.configure(text=desc, text_color=("#64748b", "#94a3b8"))
 
     def _on_git_status_btn_click(self):
         if self.git_engine.is_git_available():
@@ -1091,24 +1474,297 @@ class GitSyncApp(ctk.CTk):
             if res_box:
                 webbrowser.open("https://git-scm.com/download/win")
 
+    # 스마트 동기화 상태 감지
+    def _trigger_inspect_status(self):
+        if self.is_syncing:
+            return
+
+        local_folder = self.folder_entry.get().strip() if hasattr(self, "folder_entry") else ""
+        raw_repo_url = self._get_selected_repo_url() if hasattr(self, "repo_combo") else ""
+        token = self.token_entry.get().strip() if hasattr(self, "token_entry") else ""
+        username = self.username_entry.get().strip() if hasattr(self, "username_entry") else ""
+        branch = self._get_selected_branch() if hasattr(self, "_get_selected_branch") else "main"
+
+        if not local_folder or not os.path.isdir(local_folder):
+            self._update_status_ui("NO_SETUP", "폴더 미선택", "동기화할 컴퓨터 폴더를 선택해주세요.", False)
+            return
+
+        if not raw_repo_url or not token:
+            self._update_status_ui("NO_SETUP", "저장소 연결 필요", "GitHub 계정 연결 및 저장소를 선택해주세요.", False)
+            return
+
+        auth_url = GitEngine.build_authenticated_url(raw_repo_url, username, token)
+
+        self.status_title_lbl.configure(text="🔍 동기화 상태 확인 중...", text_color=("#334155", "#94a3b8"))
+        self.status_desc_lbl.configure(text="GitHub과 로컬의 최신 변경사항을 비교하고 있습니다.")
+        self.status_refresh_btn.configure(state="disabled", text="확인 중...")
+
+        def _worker():
+            try:
+                code, title, desc, has_new = self.git_engine.inspect_sync_status(local_folder, auth_url, branch)
+                self.after(0, lambda: self._update_status_ui(code, title, desc, has_new))
+            except Exception as e:
+                self.after(0, lambda: self._update_status_ui("ERROR", "확인 실패", f"오류: {str(e)}", False))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _update_status_ui(self, code, title, desc, has_remote_new):
+        self.status_refresh_btn.configure(state="normal", text="🔄 상태 새로고침")
+
+        if code == "BEHIND":
+            self.sync_status_banner.configure(
+                fg_color=("#eff6ff", "#172554"),
+                border_color=("#93c5fd", "#1d4ed8")
+            )
+            self.status_title_lbl.configure(text=f"🔔 {title}", text_color=("#1d4ed8", "#93c5fd"))
+            self.status_desc_lbl.configure(text=desc, text_color=("#2563eb", "#bfdbfe"))
+            self.status_quick_pull_btn.pack(side="left", padx=(0, 8))
+            self.status_quick_pull_btn.configure(
+                text="⬇️ 지금 바로 내려받기",
+                fg_color="#0969da",
+                hover_color="#0860ca",
+                command=lambda: self._start_git_task("pull")
+            )
+
+        elif code == "UP_TO_DATE":
+            self.status_quick_pull_btn.pack_forget()
+            self.sync_status_banner.configure(
+                fg_color=("#f0fdf4", "#052e16"),
+                border_color=("#86efac", "#15803d")
+            )
+            self.status_title_lbl.configure(text=f"✅ {title}", text_color=("#15803d", "#86efac"))
+            self.status_desc_lbl.configure(text=desc, text_color=("#16a34a", "#bbf7d0"))
+
+        elif code in ("LOCAL_MODIFIED", "AHEAD"):
+            self.status_quick_pull_btn.pack_forget()
+            self.sync_status_banner.configure(
+                fg_color=("#eef2ff", "#1e1b4b"),
+                border_color=("#a5b4fc", "#4338ca")
+            )
+            self.status_title_lbl.configure(text=f"⬆️ {title}", text_color=("#4338ca", "#a5b4fc"))
+            self.status_desc_lbl.configure(text=desc, text_color=("#4f46e5", "#c7d2fe"))
+
+        elif code == "DIVERGED":
+            self.sync_status_banner.configure(
+                fg_color=("#fffbeb", "#451a03"),
+                border_color=("#fde68a", "#b45309")
+            )
+            self.status_title_lbl.configure(text=f"⚠️ {title}", text_color=("#b45309", "#fde68a"))
+            self.status_desc_lbl.configure(text=desc, text_color=("#92400e", "#fef3c7"))
+            self.status_quick_pull_btn.pack(side="left", padx=(0, 8))
+            self.status_quick_pull_btn.configure(
+                text="🚀 지금 전체 동기화",
+                fg_color="#d97706",
+                hover_color="#b45309",
+                command=lambda: self._start_git_task("sync")
+            )
+
+        else:
+            self.status_quick_pull_btn.pack_forget()
+            self.sync_status_banner.configure(
+                fg_color=("#f8fafc", "#0f172a"),
+                border_color=("#e2e8f0", "#1e293b")
+            )
+            self.status_title_lbl.configure(text=f"ℹ️ {title}", text_color=("#475569", "#cbd5e1"))
+            self.status_desc_lbl.configure(text=desc, text_color=("#64748b", "#94a3b8"))
+
+    # 다중 프로필 관리
+    def _on_profile_change(self, new_profile):
+        old_profile = self.config_data.get("active_profile", "기본 작업")
+        if old_profile in self.config_data.get("profiles", {}):
+            self.config_data["profiles"][old_profile]["local_folder"] = self.folder_entry.get().strip()
+            self.config_data["profiles"][old_profile]["selected_repo"] = self.repo_combo.get().strip()
+            self.config_data["profiles"][old_profile]["branch"] = self._get_selected_branch()
+
+        self.config_data["active_profile"] = new_profile
+        new_data = self.config_data["profiles"].get(new_profile, {})
+
+        self.folder_entry.delete(0, "end")
+        if new_data.get("local_folder"):
+            self.folder_entry.insert(0, new_data["local_folder"])
+
+        saved_repo = new_data.get("selected_repo", "")
+        if saved_repo:
+            matched = False
+            vals = self.repo_combo.cget("values")
+            for v in vals:
+                if saved_repo.split()[0] in v:
+                    self.repo_combo.set(v)
+                    matched = True
+                    break
+            if not matched and vals:
+                self.repo_combo.set(saved_repo)
+        elif self.repos_list:
+            self._update_repo_combobox()
+
+        self._save_current_settings()
+        self._log(f"📁 프로필이 전환되었습니다: '{new_profile}'")
+        self._trigger_inspect_status()
+
+    def _add_profile(self):
+        dialog = ctk.CTkInputDialog(
+            text="새 동기화 프로필 이름을 입력하세요:\n(예: 회사 문서, 블로그, 개인 프로젝트)",
+            title="새 프로필 추가"
+        )
+        name = dialog.get_input()
+        if not name or not name.strip():
+            return
+        name = name.strip()
+
+        if "profiles" not in self.config_data:
+            self.config_data["profiles"] = {}
+
+        if name in self.config_data["profiles"]:
+            messagebox.showwarning("중복", f"'{name}' 프로필이 이미 존재합니다.")
+            return
+
+        curr = self.config_data.get("active_profile", "기본 작업")
+        if curr in self.config_data["profiles"]:
+            self.config_data["profiles"][curr]["local_folder"] = self.folder_entry.get().strip()
+            self.config_data["profiles"][curr]["selected_repo"] = self.repo_combo.get().strip()
+            self.config_data["profiles"][curr]["branch"] = self._get_selected_branch()
+
+        self.config_data["profiles"][name] = {
+            "local_folder": "",
+            "selected_repo": "",
+            "branch": "main"
+        }
+        self.config_data["active_profile"] = name
+
+        p_names = list(self.config_data["profiles"].keys())
+        self.profile_combo.configure(values=p_names)
+        self.profile_combo.set(name)
+
+        self.folder_entry.delete(0, "end")
+        if self.repos_list:
+            self._update_repo_combobox()
+
+        self._save_current_settings()
+        self._log(f"➕ 새 프로필이 생성되었습니다: '{name}'")
+        self._trigger_inspect_status()
+
+    def _rename_profile(self):
+        curr = self.profile_combo.get().strip()
+        if not curr:
+            return
+
+        dialog = ctk.CTkInputDialog(
+            text=f"현재 선택된 '{curr}' 프로필의 새 이름을 입력하세요:",
+            title="프로필 이름 변경"
+        )
+        new_name = dialog.get_input()
+        if not new_name or not new_name.strip():
+            return
+        new_name = new_name.strip()
+
+        if new_name == curr:
+            return
+
+        if "profiles" not in self.config_data:
+            self.config_data["profiles"] = {}
+
+        if new_name in self.config_data["profiles"]:
+            messagebox.showwarning("중복", f"'{new_name}' 프로필이 이미 존재합니다.")
+            return
+
+        # 기존 프로필 데이터 유지하면서 키 이름 변경
+        curr_data = self.config_data["profiles"].pop(curr, {
+            "local_folder": self.folder_entry.get().strip(),
+            "selected_repo": self.repo_combo.get().strip(),
+            "branch": self._get_selected_branch()
+        })
+        curr_data["local_folder"] = self.folder_entry.get().strip()
+        curr_data["selected_repo"] = self.repo_combo.get().strip()
+        curr_data["branch"] = self._get_selected_branch()
+
+        self.config_data["profiles"][new_name] = curr_data
+        self.config_data["active_profile"] = new_name
+
+        p_names = list(self.config_data["profiles"].keys())
+        self.profile_combo.configure(values=p_names)
+        self.profile_combo.set(new_name)
+
+        self._save_current_settings()
+        self._log(f"✏️ 프로필 이름이 '{curr}'에서 '{new_name}'(으)로 변경되었습니다.")
+
+    def _delete_profile(self):
+        profiles = self.config_data.get("profiles", {})
+        if len(profiles) <= 1:
+            messagebox.showwarning("삭제 불가", "최소 1개 이상의 프로필이 유지되어야 하므로 삭제할 수 없습니다.")
+            return
+
+        active = self.profile_combo.get().strip()
+        ans = messagebox.askyesno(
+            "프로필 삭제 확인",
+            f"'{active}' 프로필 설정을 정말 삭제하시겠습니까?\n\n(실제 컴퓨터 폴더나 GitHub 저장소의 파일은 삭제되지 않습니다.)"
+        )
+        if not ans:
+            return
+
+        if active in self.config_data["profiles"]:
+            del self.config_data["profiles"][active]
+
+        remaining = list(self.config_data["profiles"].keys())
+        new_active = remaining[0]
+        self.config_data["active_profile"] = new_active
+
+        self.profile_combo.configure(values=remaining)
+        self.profile_combo.set(new_active)
+
+        new_data = self.config_data["profiles"][new_active]
+        self.folder_entry.delete(0, "end")
+        if new_data.get("local_folder"):
+            self.folder_entry.insert(0, new_data["local_folder"])
+
+        saved_repo = new_data.get("selected_repo", "")
+        if saved_repo:
+            self.repo_combo.set(saved_repo)
+
+        self._save_current_settings()
+        self._log(f"🗑️ 프로필 '{active}'이(가) 삭제되었습니다. '{new_active}'(으)로 전환되었습니다.")
+        self._trigger_inspect_status()
+
+    # 설정 불러오기 및 저장
     def _load_saved_settings(self):
         c = self.config_data
         if c.get("username"):
             self.username_entry.insert(0, c["username"])
         if c.get("token") and c.get("remember_token", True):
             self.token_entry.insert(0, c["token"])
-        if c.get("local_folder"):
-            self.folder_entry.insert(0, c["local_folder"])
+
+        self.remember_var.set(c.get("remember_token", True))
+        self.tray_var.set(c.get("minimize_to_tray", True))
+        self.autostart_var.set(win_autostart.is_autostart_enabled())
+
         if c.get("auto_sync_interval"):
             self.interval_combo.set(f"{c['auto_sync_interval']}분")
-        self.remember_var.set(c.get("remember_token", True))
 
-        # 토큰이 저장되어 있다면 백그라운드에서 자동 연결 시도
+        # 프로필 로드
+        profiles = c.get("profiles", {})
+        if not profiles:
+            profiles = {"기본 작업": {"local_folder": "", "selected_repo": "", "branch": "main"}}
+            c["profiles"] = profiles
+
+        p_names = list(profiles.keys())
+        self.profile_combo.configure(values=p_names)
+
+        active = c.get("active_profile", p_names[0])
+        if active not in profiles:
+            active = p_names[0]
+        self.profile_combo.set(active)
+
+        active_data = profiles[active]
+        if active_data.get("local_folder"):
+            self.folder_entry.insert(0, active_data["local_folder"])
+
+        # 토큰이 저장되어 있다면 백그라운드 자동 연결
         if c.get("token"):
             self.after(500, self._on_click_connect)
 
-        # 초기 동기화 상태 점검 예약
         self.after(1500, self._trigger_inspect_status)
+
+        # 3초 후 백그라운드 새 버전 업데이트 확인
+        self.after(3000, self._check_update_in_background)
 
     def _save_current_settings(self):
         interval_str = self.interval_combo.get().replace("분", "").strip()
@@ -1117,19 +1773,130 @@ class GitSyncApp(ctk.CTk):
         except ValueError:
             interval_val = 10
 
+        active_p = self.profile_combo.get().strip() if hasattr(self, "profile_combo") else "기본 작업"
+        if "profiles" not in self.config_data:
+            self.config_data["profiles"] = {}
+
+        if active_p in self.config_data["profiles"]:
+            self.config_data["profiles"][active_p]["local_folder"] = self.folder_entry.get().strip() if hasattr(self, "folder_entry") else ""
+            self.config_data["profiles"][active_p]["selected_repo"] = self.repo_combo.get().strip() if hasattr(self, "repo_combo") else ""
+            self.config_data["profiles"][active_p]["branch"] = self._get_selected_branch()
+
         c = {
-            "username": self.username_entry.get().strip(),
-            "token": self.token_entry.get().strip(),
-            "remember_token": self.remember_var.get(),
-            "local_folder": self.folder_entry.get().strip(),
-            "selected_repo": self.repo_combo.get().strip(),
-            "branch": self._get_selected_branch(),
-            "auto_sync_enabled": self.auto_sync_var.get(),
-            "auto_sync_interval": interval_val
+            "username": self.username_entry.get().strip() if hasattr(self, "username_entry") else "",
+            "token": self.token_entry.get().strip() if hasattr(self, "token_entry") else "",
+            "remember_token": self.remember_var.get() if hasattr(self, "remember_var") else True,
+            "minimize_to_tray": self.tray_var.get() if hasattr(self, "tray_var") else True,
+            "autostart": self.autostart_var.get() if hasattr(self, "autostart_var") else False,
+            "auto_sync_enabled": self.auto_sync_var.get() if hasattr(self, "auto_sync_var") else False,
+            "auto_sync_interval": interval_val,
+            "active_profile": active_p,
+            "profiles": self.config_data["profiles"]
         }
         self.config_data = c
         save_config(c)
 
+    def _on_toggle_autostart(self):
+        val = self.autostart_var.get()
+        ok = win_autostart.set_autostart(val)
+        if ok:
+            self._log(f"🚀 윈도우 시작 시 자동 실행이 {'활성화' if val else '비활성화'}되었습니다.")
+        else:
+            self._log("⚠️ 윈도우 시작 레지스트리 설정 변경에 실패했습니다.")
+        self._save_current_settings()
+
+    # 시스템 트레이
+    def _setup_tray_icon(self):
+        try:
+            if os.path.exists(self.icon_path):
+                img = Image.open(self.icon_path)
+            else:
+                img = Image.new("RGBA", (64, 64), color=(59, 130, 246))
+
+            menu = pystray.Menu(
+                item("깃싱크 열기", lambda: self.after(0, self._restore_from_tray), default=True),
+                item("원클릭 전체 동기화 실행", lambda: self.after(0, lambda: self._start_git_task("sync"))),
+                pystray.Menu.SEPARATOR,
+                item("프로그램 종료", lambda: self.after(0, self._quit_app))
+            )
+            self.tray_icon = pystray.Icon("GitSync", img, APP_WINDOW_TITLE, menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception as e:
+            print(f"시스템 트레이 초기화 실패: {e}")
+
+    def _on_close_window(self):
+        if self.tray_var.get():
+            self.withdraw()
+            if self.tray_icon and self._first_tray_notify:
+                self._first_tray_notify = False
+                try:
+                    self.tray_icon.notify(
+                        "깃싱크가 시스템 트레이(시계 옆)에서 계속 실행 중입니다.\n아이콘을 더블클릭하면 다시 열립니다.",
+                        "깃싱크 (GitSync)"
+                    )
+                except Exception:
+                    pass
+        else:
+            self._quit_app()
+
+    def _restore_from_tray(self):
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.focus_force()
+
+    def _quit_app(self):
+        if self.tray_icon:
+            try:
+                self.tray_icon.visible = False
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.destroy()
+        sys.exit(0)
+
+    # 새 버전 업데이트 알림
+    def _check_update_in_background(self):
+        token = self.token_entry.get().strip() if hasattr(self, "token_entry") else ""
+        repo_url = self._get_selected_repo_url()
+        repo_name = "izax8839/gith"
+        if repo_url and "github.com/" in repo_url:
+            parts = repo_url.split("github.com/")[-1].replace(".git", "").split("/")
+            if len(parts) >= 2:
+                repo_name = f"{parts[0]}/{parts[1]}"
+
+        def _worker():
+            ok, release = GitHubAPI.check_latest_release(token, repo_name)
+            if ok and release:
+                tag = release.get("tag_name", "").strip()
+                if tag and is_newer_version(tag, APP_VERSION):
+                    self.after(0, lambda: self._show_update_banner(release))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_update_banner(self, release):
+        tag = release.get("tag_name", "새 버전")
+        url = release.get("html_url", "")
+        self.update_msg_lbl.configure(text=f"🎉 새로운 버전({tag})이 출시되었습니다! 최신 기능과 개선사항을 받아보세요.")
+        self.update_download_btn.configure(command=lambda: webbrowser.open(url))
+        self.update_banner_frame.grid(row=1, column=0, padx=22, pady=(0, 6), sticky="ew")
+
+    def _manual_check_update(self):
+        token = self.token_entry.get().strip() if hasattr(self, "token_entry") else ""
+        self._log("🔍 최신 버전 업데이트를 확인하는 중...")
+        def _worker():
+            ok, release = GitHubAPI.check_latest_release(token, "izax8839/gith")
+            if ok and release:
+                tag = release.get("tag_name", "").strip()
+                if tag and is_newer_version(tag, APP_VERSION):
+                    self.after(0, lambda: self._show_update_banner(release))
+                    self.after(0, lambda: messagebox.showinfo("새 버전 발견", f"새로운 버전({tag})이 있습니다!\n상단 다운로드 배너를 확인하세요."))
+                    return
+            self.after(0, lambda: messagebox.showinfo("최신 버전", f"현재 최신 버전({APP_VERSION})을 사용하고 계십니다!"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # 계정 연결
     def _on_click_connect(self):
         token = self.token_entry.get().strip()
         if not token:
@@ -1159,9 +1926,7 @@ class GitSyncApp(ctk.CTk):
         self.connect_btn.configure(state="normal", text="🔗 연결 & 저장소 불러오기")
         uname = user_info.get("login", "")
         name = user_info.get("name") or uname
-        public_repos = user_info.get("public_repos", 0)
 
-        # username 입력창이 비어있으면 자동 기입
         if not self.username_entry.get().strip():
             self.username_entry.delete(0, "end")
             self.username_entry.insert(0, uname)
@@ -1185,8 +1950,8 @@ class GitSyncApp(ctk.CTk):
         names = [f"{r['full_name']} {'(🔒비공개)' if r.get('private') else '(🌐공개)'}" for r in self.repos_list]
         self.repo_combo.configure(values=names)
 
-        saved = self.config_data.get("selected_repo", "")
-        # 저장된 값이 목록에 있으면 선택
+        active = self.config_data.get("active_profile", "기본 작업")
+        saved = self.config_data.get("profiles", {}).get(active, {}).get("selected_repo", "")
         matched = False
         if saved:
             for item in names:
@@ -1207,19 +1972,16 @@ class GitSyncApp(ctk.CTk):
         if not choice or choice.startswith("["):
             return None
 
-        # 이름 추출 (예: 'owner/repo (🔒비공개)' -> 'owner/repo')
         clean_name = choice.split()[0]
         for r in self.repos_list:
             if r.get("full_name") == clean_name:
                 return r.get("clone_url") or r.get("html_url")
 
-        # 만약 직접 URL을 입력한 경우
         if clean_name.startswith("http://") or clean_name.startswith("https://"):
             return clean_name
         return f"https://github.com/{clean_name}.git"
 
     def _get_selected_branch(self):
-        """선택한 저장소의 기본 브랜치(main/master 등)를 스스로 감지하여 반환합니다."""
         choice = self.repo_combo.get().strip()
         if choice and not choice.startswith("["):
             clean_name = choice.split()[0]
@@ -1242,10 +2004,8 @@ class GitSyncApp(ctk.CTk):
             self.progress_bar.stop()
             self.progress_bar.set(0)
 
+    # 동기화 실행 메인 (100MB 사전 감지 포함)
     def _start_git_task(self, task_type):
-        """
-        task_type: 'sync', 'pull', 'push'
-        """
         if self.is_syncing:
             messagebox.showinfo("알림", "이미 동기화 작업이 진행 중입니다.")
             return
@@ -1265,13 +2025,29 @@ class GitSyncApp(ctk.CTk):
             messagebox.showerror("오류", "GitHub 토큰을 입력해주세요.")
             return
 
+        # 100MB 대용량 파일 사전 감지 (sync, push 작업 시)
+        if task_type in ("sync", "push"):
+            large_files = self.git_engine.check_large_files(local_folder, max_size_mb=98)
+            if large_files:
+                def on_ignore():
+                    rel_paths = [f["rel_path"] for f in large_files]
+                    self.git_engine.ignore_large_files(local_folder, rel_paths)
+                    self._log(f"⚡ 100MB 초과 파일 {len(large_files)}개를 .gitignore에 등록하여 안전하게 제외했습니다.")
+                    self._run_actual_git_task(task_type, local_folder, raw_repo_url, token)
+
+                def on_cancel():
+                    self._log("⚠️ 100MB 초과 파일 감지로 인해 동기화 작업이 취소되었습니다.")
+
+                LargeFileDialog(self, large_files, on_ignore, on_cancel)
+                return
+
+        self._run_actual_git_task(task_type, local_folder, raw_repo_url, token)
+
+    def _run_actual_git_task(self, task_type, local_folder, raw_repo_url, token):
         username = self.username_entry.get().strip()
         branch = self._get_selected_branch()
-
-        # 인증 URL 생성
         auth_url = GitEngine.build_authenticated_url(raw_repo_url, username, token)
 
-        # 커밋 메시지 생성: [시간] + 사용자 입력 메모/제목
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         user_title = self.commit_msg_entry.get().strip() if hasattr(self, "commit_msg_entry") else ""
         if user_title:
@@ -1315,7 +2091,6 @@ class GitSyncApp(ctk.CTk):
         tname = task_names.get(task_type, "작업")
 
         if ok:
-            # 성공 시 입력창 초기화
             if hasattr(self, "commit_msg_entry"):
                 self.commit_msg_entry.delete(0, "end")
             self._log(f"🎉 {tname} 작업이 성공적으로 완료되었습니다!")
@@ -1323,10 +2098,9 @@ class GitSyncApp(ctk.CTk):
             self._log(f"❌ {tname} 실패: {msg}")
             messagebox.showerror(f"{tname} 오류", f"작업 중 오류가 발생했습니다:\n\n{msg}")
 
-        # 작업 완료 후 상태 재진단
         self.after(500, self._trigger_inspect_status)
 
-    # 자동 동기화 관련
+    # 주기적 자동 동기화
     def _on_toggle_auto_sync(self):
         enabled = self.auto_sync_var.get()
         self._save_current_settings()
@@ -1378,13 +2152,11 @@ def check_single_instance():
         kernel32 = ctypes.windll.kernel32
         user32 = ctypes.windll.user32
 
-        MUTEX_NAME = "GitSync_Desktop_App_Single_Instance_Mutex_Global"
-        mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        mutex = kernel32.CreateMutexW(None, False, APP_MUTEX_NAME)
         ERROR_ALREADY_EXISTS = 183
 
         if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            window_title = "깃싱크 (GitSync) - 초간편 한글 GitHub 폴더 동기화"
-            hwnd = user32.FindWindowW(None, window_title)
+            hwnd = user32.FindWindowW(None, APP_WINDOW_TITLE)
             if hwnd:
                 user32.ShowWindow(hwnd, 9)  # SW_RESTORE (9)
                 user32.SetForegroundWindow(hwnd)
