@@ -1,8 +1,6 @@
 # 🐙 깃싱크 (GitSync) - 초간편 한글 GitHub 폴더 동기화 프로그램
 
-> ### 📥 [최신 버전 다운로드 바로가기 (Windows용 gitsync_v1.0.exe)](https://github.com)
-
-
+### 📥 [최신 버전 다운로드](https://github.com/izax8839/gith/releases/latest)
 
 
 GitHub Desktop이 영어로 되어 있고 복잡하셨던 분들을 위해 만든 **초간단 100% 한글 GUI 동기화 프로그램**입니다.  
